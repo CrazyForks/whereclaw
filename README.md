@@ -49,3 +49,21 @@ npm run prepare:openclaw-engine:windows
 - macOS distribution still requires Apple signing and notarization secrets before external release.
 - Linux runners install WebKit/AppImage packaging dependencies before running `tauri build`.
 - The bundled engine runtime is platform-specific and prepared inside CI before packaging.
+
+## macOS signing secrets
+
+To avoid Gatekeeper treating downloaded macOS builds as broken or untrusted, configure these GitHub Actions secrets before shipping releases:
+
+- `APPLE_SIGNING_IDENTITY`
+- `APPLE_CERTIFICATE`
+- `APPLE_CERTIFICATE_PASSWORD`
+- `APPLE_API_KEY`
+- `APPLE_API_KEY_P8`
+- `APPLE_API_ISSUER`
+
+Alternatively, notarization can use Apple ID credentials:
+
+- `APPLE_ID`
+- `APPLE_PASSWORD`
+- `APPLE_TEAM_ID`
+- `APPLE_PROVIDER_SHORT_NAME` (only when needed)

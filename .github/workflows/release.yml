@@ -26,26 +26,34 @@ jobs:
             runner: macos-15
             rust_target: aarch64-apple-darwin
             prepare_command: npm run prepare:openclaw-engine
-            tauri_bundles: app,dmg
+            tauri_bundles: app
             artifact_name: whereclaw-macos-arm64
+            collect_mac_dmg: true
+            build_manual_dmg: true
           - name: macOS Intel
             runner: macos-15-intel
             rust_target: x86_64-apple-darwin
             prepare_command: npm run prepare:openclaw-engine
             tauri_bundles: app
             artifact_name: whereclaw-macos-x64
+            collect_mac_dmg: true
+            build_manual_dmg: true
           - name: Windows x64
             runner: windows-latest
             rust_target: x86_64-pc-windows-msvc
             prepare_command: npm run prepare:openclaw-engine:windows
             tauri_bundles: nsis
             artifact_name: whereclaw-windows-x64
+            collect_mac_dmg: false
+            build_manual_dmg: false
           - name: Linux x64
             runner: ubuntu-24.04
             rust_target: x86_64-unknown-linux-gnu
             prepare_command: npm run prepare:openclaw-engine
             tauri_bundles: appimage,deb,rpm
             artifact_name: whereclaw-linux-x64
+            collect_mac_dmg: false
+            build_manual_dmg: false
 
     steps:
       - name: Checkout
@@ -56,6 +64,17 @@ jobs:
         with:
           node-version: 22
           cache: npm
+
+      - name: Prepare Apple notarization key
+        if: runner.os == 'macOS' && secrets.APPLE_API_KEY_P8 != '' && secrets.APPLE_API_KEY != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p private_keys
+          key_path="private_keys/AuthKey_${{ secrets.APPLE_API_KEY }}.p8"
+          printf '%s' '${{ secrets.APPLE_API_KEY_P8 }}' > "$key_path"
+          chmod 600 "$key_path"
+          echo "APPLE_API_KEY_PATH=$key_path" >> "$GITHUB_ENV"
 
       - name: Install Rust target
         run: rustup target add ${{ matrix.rust_target }}
@@ -74,7 +93,8 @@ jobs:
             libjavascriptcoregtk-4.1-dev \
             libsoup-3.0-dev \
             libxdo-dev \
-            fuse3
+            fuse3 \
+            zstd
 
       - name: Install frontend dependencies
         run: npm ci
@@ -83,29 +103,68 @@ jobs:
         run: ${{ matrix.prepare_command }}
 
       - name: Build application
+        id: build_app
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_PATH: ${{ env.APPLE_API_KEY_PATH }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_PROVIDER_SHORT_NAME: ${{ secrets.APPLE_PROVIDER_SHORT_NAME }}
         run: npm run tauri build -- --target ${{ matrix.rust_target }} --bundles ${{ matrix.tauri_bundles }}
 
+      - name: Re-sign macOS app bundle ad-hoc
+        if: runner.os == 'macOS' && steps.build_app.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_DIR="src-tauri/target/${{ matrix.rust_target }}/release/bundle/macos/WhereClaw.app"
+          codesign --force --deep --sign - "$APP_DIR"
+          codesign --verify --deep --strict --verbose=2 "$APP_DIR"
+          codesign -dv --verbose=4 "$APP_DIR" 2>&1 | sed -n '1,120p'
+          spctl -a -vv "$APP_DIR" || true
+
+      - name: Build macOS DMG manually
+        if: runner.os == 'macOS' && matrix.build_manual_dmg && steps.build_app.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_DIR="src-tauri/target/${{ matrix.rust_target }}/release/bundle/macos/WhereClaw.app"
+          STAGE_DIR="src-tauri/target/${{ matrix.rust_target }}/release/manual-dmg"
+          DMG_DIR="src-tauri/target/${{ matrix.rust_target }}/release/bundle/dmg"
+          if [[ "${{ matrix.rust_target }}" == "aarch64-apple-darwin" ]]; then
+            ARCH_SUFFIX="aarch64"
+          else
+            ARCH_SUFFIX="x64"
+          fi
+          rm -rf "$STAGE_DIR"
+          mkdir -p "$STAGE_DIR" "$DMG_DIR"
+          cp -R "$APP_DIR" "$STAGE_DIR/WhereClaw.app"
+          hdiutil create -volname "WhereClaw" -srcfolder "$STAGE_DIR" -ov -format UDZO "$DMG_DIR/WhereClaw_1.0.0_${ARCH_SUFFIX}.dmg"
+
       - name: Collect artifacts (macOS)
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && steps.build_app.outcome == 'success'
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p ci-artifacts
-          APP_DIR="src-tauri/target/${{ matrix.rust_target }}/release/bundle/macos/WhereClaw.app"
-          if [[ -d "$APP_DIR" ]]; then
-            ditto -c -k --sequesterRsrc --keepParent "$APP_DIR" "ci-artifacts/WhereClaw_${{ matrix.rust_target }}.app.zip"
+          if [[ '${{ matrix.collect_mac_dmg }}' == 'true' ]]; then
+            find "src-tauri/target/${{ matrix.rust_target }}/release/bundle/dmg" -maxdepth 1 -type f -name '*.dmg' -exec cp {} ci-artifacts/ \; 2>/dev/null || true
           fi
-          find "src-tauri/target/${{ matrix.rust_target }}/release/bundle/dmg" -maxdepth 1 -type f -name '*.dmg' -exec cp {} ci-artifacts/ \; 2>/dev/null || true
 
       - name: Collect artifacts (Windows)
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && steps.build_app.outcome == 'success'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path ci-artifacts | Out-Null
           Get-ChildItem "src-tauri/target/${{ matrix.rust_target }}/release/bundle" -Recurse -Include *.exe | Copy-Item -Destination ci-artifacts -Force
 
       - name: Collect artifacts (Linux)
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && steps.build_app.outcome == 'success'
         shell: bash
         run: |
           set -euo pipefail
@@ -113,6 +172,7 @@ jobs:
           find "src-tauri/target/${{ matrix.rust_target }}/release/bundle" -type f \( -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' \) -exec cp {} ci-artifacts/ \;
 
       - name: Upload workflow artifact
+        if: always() && hashFiles('ci-artifacts/*') != ''
         uses: actions/upload-artifact@v5
         with:
           name: ${{ matrix.artifact_name }}

@@ -187,6 +187,7 @@ download_and_extract_ollama() {
   local archive_path
   local extract_dir
   local runtime_dir
+  local ollama_binary
 
   platform_dir="$(detect_ollama_platform_dir)"
   archive_name="$(detect_ollama_archive_for "$(uname -s)" "$(uname -m)")"
@@ -211,9 +212,19 @@ download_and_extract_ollama() {
   mkdir -p "$runtime_dir"
   cp -R "$extract_dir"/. "$runtime_dir"
 
-  if [[ ! -x "$runtime_dir/ollama" ]]; then
+  ollama_binary="$(find "$runtime_dir" -type f -name ollama -perm -111 | head -n 1 || true)"
+  if [[ -z "$ollama_binary" ]]; then
+    ollama_binary="$(find "$runtime_dir" -type f -name ollama | head -n 1 || true)"
+  fi
+
+  if [[ -z "$ollama_binary" ]]; then
     echo "Bundled Ollama runtime is missing ollama binary." >&2
     exit 1
+  fi
+
+  if [[ "$ollama_binary" != "$runtime_dir/ollama" ]]; then
+    cp "$ollama_binary" "$runtime_dir/ollama"
+    chmod +x "$runtime_dir/ollama"
   fi
 }
 

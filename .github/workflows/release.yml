@@ -8,6 +8,9 @@ on:
       - 'v*'
   pull_request:
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 permissions:
   contents: write
 
@@ -22,43 +25,34 @@ jobs:
           - name: macOS Apple Silicon
             runner: macos-15
             rust_target: aarch64-apple-darwin
-            artifact_name: whereclaw-macos-arm64
-            bundle_glob: |
-              src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
-              src-tauri/target/aarch64-apple-darwin/release/bundle/macos/*.app
             prepare_command: npm run prepare:openclaw-engine
+            tauri_bundles: app,dmg
+            artifact_name: whereclaw-macos-arm64
           - name: macOS Intel
             runner: macos-15-intel
             rust_target: x86_64-apple-darwin
-            artifact_name: whereclaw-macos-x64
-            bundle_glob: |
-              src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg
-              src-tauri/target/x86_64-apple-darwin/release/bundle/macos/*.app
             prepare_command: npm run prepare:openclaw-engine
+            tauri_bundles: app
+            artifact_name: whereclaw-macos-x64
           - name: Windows x64
             runner: windows-latest
             rust_target: x86_64-pc-windows-msvc
-            artifact_name: whereclaw-windows-x64
-            bundle_glob: |
-              src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
-              src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
             prepare_command: npm run prepare:openclaw-engine:windows
+            tauri_bundles: nsis
+            artifact_name: whereclaw-windows-x64
           - name: Linux x64
             runner: ubuntu-24.04
             rust_target: x86_64-unknown-linux-gnu
-            artifact_name: whereclaw-linux-x64
-            bundle_glob: |
-              src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage
-              src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb
-              src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/rpm/*.rpm
             prepare_command: npm run prepare:openclaw-engine
+            tauri_bundles: appimage,deb,rpm
+            artifact_name: whereclaw-linux-x64
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: 22
           cache: npm
@@ -89,14 +83,41 @@ jobs:
         run: ${{ matrix.prepare_command }}
 
       - name: Build application
-        run: npm run tauri build -- --target ${{ matrix.rust_target }}
+        run: npm run tauri build -- --target ${{ matrix.rust_target }} --bundles ${{ matrix.tauri_bundles }}
+
+      - name: Collect artifacts (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ci-artifacts
+          APP_DIR="src-tauri/target/${{ matrix.rust_target }}/release/bundle/macos/WhereClaw.app"
+          if [[ -d "$APP_DIR" ]]; then
+            ditto -c -k --sequesterRsrc --keepParent "$APP_DIR" "ci-artifacts/WhereClaw_${{ matrix.rust_target }}.app.zip"
+          fi
+          find "src-tauri/target/${{ matrix.rust_target }}/release/bundle/dmg" -maxdepth 1 -type f -name '*.dmg' -exec cp {} ci-artifacts/ \; 2>/dev/null || true
+
+      - name: Collect artifacts (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path ci-artifacts | Out-Null
+          Get-ChildItem "src-tauri/target/${{ matrix.rust_target }}/release/bundle" -Recurse -Include *.exe | Copy-Item -Destination ci-artifacts -Force
+
+      - name: Collect artifacts (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ci-artifacts
+          find "src-tauri/target/${{ matrix.rust_target }}/release/bundle" -type f \( -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' \) -exec cp {} ci-artifacts/ \;
 
       - name: Upload workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: ${{ matrix.artifact_name }}
           if-no-files-found: error
-          path: ${{ matrix.bundle_glob }}
+          path: ci-artifacts/*
 
   release:
     name: Publish GitHub Release
@@ -106,7 +127,7 @@ jobs:
 
     steps:
       - name: Download workflow artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           path: release-artifacts
 

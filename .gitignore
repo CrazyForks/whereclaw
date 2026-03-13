@@ -1,0 +1,35 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+whereclaw-engine/node
+whereclaw-engine/node.exe
+whereclaw-engine/node-runtime/
+whereclaw-engine/ollama/
+whereclaw-engine/openclaw/node_modules/
+whereclaw-engine/openclaw/package.json
+whereclaw-engine/openclaw/package-lock.json
+whereclaw-engine/openclaw/.npmrc
+.worktrees/
+
+src-tauri/target/

@@ -46,7 +46,8 @@ npm run prepare:openclaw-engine:windows
 
 ## Notes
 
-- macOS distribution still requires Apple signing and notarization secrets before external release.
+- macOS builds are currently ad-hoc re-signed in CI so they avoid the broken-bundle state, but they are still not Apple-notarized.
+- Windows builds are currently published as portable `.zip` bundles instead of installer `.exe` packages.
 - Linux runners install WebKit/AppImage packaging dependencies before running `tauri build`.
 - The bundled engine runtime is platform-specific and prepared inside CI before packaging.
 

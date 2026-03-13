@@ -31,5 +31,5 @@ whereclaw-engine/openclaw/package.json
 whereclaw-engine/openclaw/package-lock.json
 whereclaw-engine/openclaw/.npmrc
 .worktrees/
-.codex
+.codex/
 src-tauri/target/

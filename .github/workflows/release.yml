@@ -42,7 +42,7 @@ jobs:
             runner: windows-latest
             rust_target: x86_64-pc-windows-msvc
             prepare_command: npm run prepare:openclaw-engine:windows
-            tauri_bundles: nsis
+            tauri_bundles: none
             artifact_name: whereclaw-windows-x64
             collect_mac_dmg: false
             build_manual_dmg: false
@@ -64,17 +64,6 @@ jobs:
         with:
           node-version: 22
           cache: npm
-
-      - name: Prepare Apple notarization key
-        if: runner.os == 'macOS' && secrets.APPLE_API_KEY_P8 != '' && secrets.APPLE_API_KEY != ''
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p private_keys
-          key_path="private_keys/AuthKey_${{ secrets.APPLE_API_KEY }}.p8"
-          printf '%s' '${{ secrets.APPLE_API_KEY_P8 }}' > "$key_path"
-          chmod 600 "$key_path"
-          echo "APPLE_API_KEY_PATH=$key_path" >> "$GITHUB_ENV"
 
       - name: Install Rust target
         run: rustup target add ${{ matrix.rust_target }}
@@ -104,17 +93,6 @@ jobs:
 
       - name: Build application
         id: build_app
-        env:
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
-          APPLE_API_KEY_PATH: ${{ env.APPLE_API_KEY_PATH }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_PROVIDER_SHORT_NAME: ${{ secrets.APPLE_PROVIDER_SHORT_NAME }}
         run: npm run tauri build -- --target ${{ matrix.rust_target }} --bundles ${{ matrix.tauri_bundles }}
 
       - name: Re-sign macOS app bundle ad-hoc
@@ -161,7 +139,12 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path ci-artifacts | Out-Null
-          Get-ChildItem "src-tauri/target/${{ matrix.rust_target }}/release/bundle" -Recurse -Include *.exe | Copy-Item -Destination ci-artifacts -Force
+          $portableRoot = "src-tauri/target/${{ matrix.rust_target }}/release/portable/WhereClaw"
+          Remove-Item -Recurse -Force $portableRoot -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $portableRoot | Out-Null
+          Copy-Item "src-tauri/target/${{ matrix.rust_target }}/release/app.exe" "$portableRoot/WhereClaw.exe"
+          Copy-Item -Recurse -Force "whereclaw-engine" "$portableRoot/whereclaw-engine"
+          Compress-Archive -Path "$portableRoot/*" -DestinationPath "ci-artifacts/WhereClaw_${{ matrix.rust_target }}_portable.zip" -Force
 
       - name: Collect artifacts (Linux)
         if: runner.os == 'Linux' && steps.build_app.outcome == 'success'

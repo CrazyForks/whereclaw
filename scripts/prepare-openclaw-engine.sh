@@ -34,12 +34,9 @@ OPTIONAL_CHANNEL_PLUGIN_DIRS=(
   "zalouser"
 )
 
-detect_ollama_platform_dir() {
-  local os
-  local arch
-
-  os="$(uname -s)"
-  arch="$(uname -m)"
+detect_ollama_platform_dir_for() {
+  local os="$1"
+  local arch="$2"
 
   case "$os" in
     Darwin)
@@ -52,8 +49,53 @@ detect_ollama_platform_dir() {
           ;;
       esac
       ;;
+    Linux)
+      case "$arch" in
+        x86_64) echo "linux-x64" ;;
+        aarch64|arm64) echo "linux-arm64" ;;
+        *)
+          echo "Unsupported Linux architecture for Ollama: $arch" >&2
+          exit 1
+          ;;
+      esac
+      ;;
     *)
       echo "Unsupported OS for bundled Ollama in this script: $os" >&2
+      exit 1
+      ;;
+  esac
+}
+
+detect_ollama_platform_dir() {
+  detect_ollama_platform_dir_for "$(uname -s)" "$(uname -m)"
+}
+
+detect_ollama_archive_for() {
+  local os="$1"
+  local arch="$2"
+
+  case "$os" in
+    Darwin)
+      case "$arch" in
+        arm64|x86_64) echo "ollama-darwin.tgz" ;;
+        *)
+          echo "Unsupported macOS architecture for Ollama archive: $arch" >&2
+          exit 1
+          ;;
+      esac
+      ;;
+    Linux)
+      case "$arch" in
+        x86_64) echo "ollama-linux-amd64.tgz" ;;
+        aarch64|arm64) echo "ollama-linux-arm64.tgz" ;;
+        *)
+          echo "Unsupported Linux architecture for Ollama archive: $arch" >&2
+          exit 1
+          ;;
+      esac
+      ;;
+    *)
+      echo "Unsupported OS for Ollama archive: $os" >&2
       exit 1
       ;;
   esac
@@ -147,7 +189,7 @@ download_and_extract_ollama() {
   local runtime_dir
 
   platform_dir="$(detect_ollama_platform_dir)"
-  archive_name="ollama-darwin.tgz"
+  archive_name="$(detect_ollama_archive_for "$(uname -s)" "$(uname -m)")"
   archive_path="$TEMP_DIR/$archive_name"
   extract_dir="$TEMP_DIR/ollama-extract"
   runtime_dir="$ENGINE_DIR/ollama/$platform_dir"
@@ -257,4 +299,6 @@ Runtime UI copy:   $NODE_RUNTIME_DIR/bin/control-ui/index.html
 EOF
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

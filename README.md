@@ -1,73 +1,51 @@
-# React + TypeScript + Vite
+# WhereClaw
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+WhereClaw is a Tauri desktop application with a React frontend and a bundled `whereclaw-engine` runtime.
 
-Currently, two official plugins are available:
+## Supported CI build targets
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) (or [oxc](https://oxc.rs) when used in [rolldown-vite](https://vite.dev/guide/rolldown)) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+GitHub Actions validates native builds for these targets on every `push` and `pull_request`:
 
-## React Compiler
+- macOS Apple Silicon
+- macOS Intel
+- Windows x64
+- Linux x64
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+Only version tags matching `v*` publish release assets.
 
-## Expanding the ESLint configuration
+## Local development
 
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
+Install dependencies:
 
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+npm install
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+Run the app in development mode:
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
-
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+npm run tauri dev
 ```
+
+Prepare the bundled engine runtime manually when needed:
+
+```bash
+npm run prepare:openclaw-engine
+```
+
+On Windows PowerShell:
+
+```powershell
+npm run prepare:openclaw-engine:windows
+```
+
+## CI release flow
+
+- `push` / `pull_request`: builds all supported platforms and uploads workflow artifacts for inspection
+- `push` of a tag like `v1.0.0`: builds all supported platforms and publishes release bundles to GitHub Releases
+
+## Notes
+
+- macOS distribution still requires Apple signing and notarization secrets before external release.
+- Linux runners install WebKit/AppImage packaging dependencies before running `tauri build`.
+- The bundled engine runtime is platform-specific and prepared inside CI before packaging.

@@ -86,8 +86,8 @@ detect_ollama_archive_for() {
       ;;
     Linux)
       case "$arch" in
-        x86_64) echo "ollama-linux-amd64.tgz" ;;
-        aarch64|arm64) echo "ollama-linux-arm64.tgz" ;;
+        x86_64) echo "ollama-linux-amd64.tar.zst" ;;
+        aarch64|arm64) echo "ollama-linux-arm64.tar.zst" ;;
         *)
           echo "Unsupported Linux architecture for Ollama archive: $arch" >&2
           exit 1
@@ -198,7 +198,14 @@ download_and_extract_ollama() {
 
   echo "Downloading Ollama $OLLAMA_VERSION ($archive_name)..."
   curl -fsSL "https://github.com/ollama/ollama/releases/download/v${OLLAMA_VERSION}/${archive_name}" -o "$archive_path"
-  tar -xzf "$archive_path" -C "$extract_dir"
+  case "$archive_name" in
+    *.tgz|*.tar.gz) tar -xzf "$archive_path" -C "$extract_dir" ;;
+    *.tar.zst) tar --zstd -xf "$archive_path" -C "$extract_dir" ;;
+    *)
+      echo "Unsupported Ollama archive format: $archive_name" >&2
+      exit 1
+      ;;
+  esac
 
   rm -rf "$runtime_dir"
   mkdir -p "$runtime_dir"

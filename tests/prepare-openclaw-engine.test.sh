@@ -16,6 +16,6 @@ assert_equals() {
 }
 
 assert_equals "linux-x64" "$(detect_ollama_platform_dir_for Linux x86_64)" "linux x64 ollama dir"
-assert_equals "ollama-linux-amd64.tgz" "$(detect_ollama_archive_for Linux x86_64)" "linux x64 ollama archive"
+assert_equals "ollama-linux-amd64.tar.zst" "$(detect_ollama_archive_for Linux x86_64)" "linux x64 ollama archive"
 
 printf 'ok\n'

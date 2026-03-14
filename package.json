@@ -9,6 +9,8 @@
     "lint": "eslint .",
     "preview": "vite preview",
     "tauri": "tauri",
+    "sync:versions": "node ./scripts/version-sync.mjs",
+    "version": "node ./scripts/version-sync.mjs --from-package-json",
     "prepare:openclaw-engine": "bash ./scripts/prepare-openclaw-engine.sh",
     "prepare:openclaw-engine:windows": "powershell -ExecutionPolicy Bypass -File ./scripts/prepare-openclaw-engine.ps1"
   },
@@ -52,5 +54,9 @@
   "bugs": {
     "url": "https://github.com/gaofc/whereclaw/issues"
   },
-  "homepage": "https://github.com/gaofc/whereclaw#readme"
+  "homepage": "https://github.com/gaofc/whereclaw#readme",
+  "directories": {
+    "doc": "docs",
+    "test": "tests"
+  }
 }

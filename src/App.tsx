@@ -1,7 +1,20 @@
 import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useMemo, useRef, useState } from "react";
-import skillsCatalogUrl from "../skills.66a05e01.json?url";
+import { getModelStepUiState } from "./onboarding/modelStep.ts";
+import { getQqContinueButtonState } from "./onboarding/qqStep.ts";
+import {
+  getGatewayStartState,
+  getGatewayStatusCardState,
+  isDownloadingRequiredLocalModel,
+  isRequiredLocalModelAvailableForGateway,
+  shouldRefreshAfterLocalModelDownload,
+} from "./runtime/gatewayState.ts";
+import {
+  areLocalModelNamesEquivalent,
+  filterVisibleLocalModels,
+  hasLocalModelSelectionChanged,
+} from "./runtime/localModelName.ts";
 
 type LauncherLanguage = "en" | "zh-CN";
 
@@ -110,6 +123,32 @@ type SkillCatalog = {
   skills: SkillCatalogEntry[];
 };
 
+type ActiveSkillCatalogPayload = {
+  version: string;
+  source: string;
+  catalog: SkillCatalog;
+};
+
+type SkillCatalogRefreshResult = {
+  version: string;
+  source: string;
+  updated: boolean;
+  desktopVersion: string | null;
+  desktopUpdateAvailable: boolean;
+};
+
+type RemoteNotificationsPayload = {
+  cn: string[];
+  en: string[];
+  source: string;
+};
+
+type RemoteDesktopVersionPayload = {
+  version: string | null;
+  updateAvailable: boolean;
+  source: string;
+};
+
 const MIN_LAUNCH_SPLASH_MS = 2000;
 
 const LOCAL_MODEL_OPTIONS = [
@@ -205,6 +244,7 @@ type Copy = {
   brandName: string;
   brandSlogan: string;
   officialWebsiteLabel: string;
+  updateAvailableLabel: string;
   consoleVersionName: string;
   navOverview: string;
   navConfig: string;
@@ -235,6 +275,7 @@ type Copy = {
   modelNameValidationEmpty: string;
   modelNameInvalid: string;
   modelNameCloudHint: string;
+  modelNoLocalHint: string;
   modelSearchInstructionPrefix: string;
   modelSearchInstructionExample: string;
   modelSearchLinkLabel: string;
@@ -363,6 +404,7 @@ type Copy = {
   statusSetupRequired: string;
   statusStartGatewayRequiresOllama: string;
   statusStartGatewayRequiresLocalModel: string;
+  statusStartGatewayWaitForModelDownload: (modelName: string) => string;
   loadInstalledSkillsFailed: string;
   toggleSkillFailed: string;
   loadSkillCatalogFailed: string;
@@ -446,6 +488,7 @@ const copyByLanguage: Record<LauncherLanguage, Copy> = {
     brandSlogan:
       "The original official OpenClaw little lobster 🦞. Run local models for free, eliminate token anxiety, and deploy with zero-config in one click.",
     officialWebsiteLabel: "Official Website",
+    updateAvailableLabel: "Update available",
     consoleVersionName: "Console",
     navOverview: "Overview",
     navConfig: "Config",
@@ -481,6 +524,8 @@ const copyByLanguage: Record<LauncherLanguage, Copy> = {
     modelNameInvalid: "Model name is invalid.",
     modelNameCloudHint:
       "This model is a cloud model, not a local model. Please use a local model name.",
+    modelNoLocalHint:
+      "OpenClaw needs at least one model. You can later add a cloud model or a local model in Config → Model Manager.",
     modelSearchInstructionPrefix: "Find models here, e.g. ",
     modelSearchInstructionExample: "qwen3.5:0.8b",
     modelSearchLinkLabel: "ollama.com/search",
@@ -623,6 +668,8 @@ const copyByLanguage: Record<LauncherLanguage, Copy> = {
       "Start the local model service before starting the gateway.",
     statusStartGatewayRequiresLocalModel:
       "Local model does not exist. Add a local model or switch models before starting the gateway.",
+    statusStartGatewayWaitForModelDownload: (modelName) =>
+      `Model ${modelName} is downloading. Wait for the download to finish, then start the gateway.`,
     loadInstalledSkillsFailed: "Failed to load installed skills.",
     toggleSkillFailed: "Failed to change skill status.",
     loadSkillCatalogFailed: "Failed to load skill catalog.",
@@ -716,6 +763,7 @@ const copyByLanguage: Record<LauncherLanguage, Copy> = {
     brandSlogan:
       "OpenClaw官方原版小龙虾🦞，运行本地模型全免费，告别token焦虑，没有网络问题，零配置轻松一键部署。",
     officialWebsiteLabel: "官方网站",
+    updateAvailableLabel: "发现新版本",
     consoleVersionName: "自由龙虾",
     navOverview: "总览",
     navConfig: "配置",
@@ -750,6 +798,8 @@ const copyByLanguage: Record<LauncherLanguage, Copy> = {
     modelNameValidationEmpty: "请先输入模型名称。",
     modelNameInvalid: "模型名称有误。",
     modelNameCloudHint: "此模型属于云端模型，非本地模型，请使用本地模型名称。",
+    modelNoLocalHint:
+      "OpenClaw 需要至少配置一个模型。您可以后续在配置页面的模型管理中添加云端模型，或者添加本地模型。",
     modelSearchInstructionPrefix: "在这里找到模型，例：",
     modelSearchInstructionExample: "qwen3.5:0.8b",
     modelSearchLinkLabel: "ollama.com/search",
@@ -886,6 +936,8 @@ const copyByLanguage: Record<LauncherLanguage, Copy> = {
     statusStartGatewayRequiresOllama: "请先启动本地模型服务，再启动网关。",
     statusStartGatewayRequiresLocalModel:
       "本地模型不存在，请添加本地模型或切换模型后启动网关。",
+    statusStartGatewayWaitForModelDownload: (modelName) =>
+      `模型 ${modelName} 正在下载，请等待下载完成后再启动网关。`,
     loadInstalledSkillsFailed: "加载技能列表失败。",
     toggleSkillFailed: "切换技能状态失败。",
     loadSkillCatalogFailed: "加载技能广场失败。",
@@ -1020,6 +1072,7 @@ export default function App() {
   const [wantsQqChannel, setWantsQqChannel] = useState<boolean | null>(null);
   const [qqAppId, setQqAppId] = useState("");
   const [qqAppSecret, setQqAppSecret] = useState("");
+  const [isApplyingInitialSetup, setIsApplyingInitialSetup] = useState(false);
   const [localModelRunProgress, setLocalModelRunProgress] =
     useState<LocalModelRunProgress | null>(null);
   const [isChannelListLoading, setIsChannelListLoading] = useState(false);
@@ -1101,6 +1154,11 @@ export default function App() {
     useState<SystemMemoryInfo | null>(null);
   const [memoryInfoFailed, setMemoryInfoFailed] = useState(false);
   const [appVersion, setAppVersion] = useState<string | null>(null);
+  const [skillsCatalogVersion, setSkillsCatalogVersion] = useState<string | null>(null);
+  const [remoteNotifications, setRemoteNotifications] = useState<RemoteNotificationsPayload | null>(null);
+  const [remoteDesktopVersion, setRemoteDesktopVersion] = useState<string | null>(null);
+  const [hasDesktopUpdate, setHasDesktopUpdate] = useState(false);
+  const [activeNotificationIndex, setActiveNotificationIndex] = useState(0);
 
   const appendFrontendStatusLog = (
     level: StatusLogLevel,
@@ -1156,12 +1214,65 @@ export default function App() {
     appendFrontendStatusLog("INFO", "statusMessage cleared", context);
   };
 
+  const ensureRemoteSkillCatalogFresh = () => {
+    if (!remoteSkillCatalogRefreshPromiseRef.current) {
+      remoteSkillCatalogRefreshPromiseRef.current = invoke<SkillCatalogRefreshResult>(
+        "ensure_remote_skill_catalog_fresh",
+      )
+        .then(async (result) => {
+          setSkillsCatalogVersion(result.version);
+          setRemoteDesktopVersion(result.desktopVersion);
+          setHasDesktopUpdate(result.desktopUpdateAvailable);
+          try {
+            const notifications = await invoke<RemoteNotificationsPayload>(
+              "read_remote_notifications",
+            );
+            setRemoteNotifications(notifications);
+          } catch {
+            setRemoteNotifications(null);
+          }
+          return result;
+        })
+        .catch(async () => {
+          setSkillsCatalogVersion((current) => current ?? null);
+          setRemoteNotifications(null);
+          try {
+            const desktopVersion = await invoke<RemoteDesktopVersionPayload>(
+              "read_remote_desktop_version",
+            );
+            setRemoteDesktopVersion(desktopVersion.version);
+            setHasDesktopUpdate(desktopVersion.updateAvailable);
+          } catch {
+            setRemoteDesktopVersion(null);
+            setHasDesktopUpdate(false);
+          }
+          return null;
+        });
+    }
+
+    return remoteSkillCatalogRefreshPromiseRef.current;
+  };
+
   const contentScrollContainerRef = useRef<HTMLElement | null>(null);
   const logsContainerRef = useRef<HTMLPreElement | null>(null);
   const shouldStickLogsToBottomRef = useRef(true);
+  const remoteSkillCatalogRefreshPromiseRef = useRef<
+    Promise<SkillCatalogRefreshResult | null> | null
+  >(null);
 
   const copy = copyByLanguage[selectedLanguage];
+  const visibleNotifications =
+    selectedLanguage === "zh-CN"
+      ? remoteNotifications?.cn ?? []
+      : remoteNotifications?.en ?? [];
+  const activeNotification =
+    visibleNotifications.length > 0
+      ? visibleNotifications[activeNotificationIndex % visibleNotifications.length]
+      : null;
   const consoleVersionLabel = `${copy.consoleVersionName} v${appVersion ?? "..."}`;
+  const desktopUpdateTitle = remoteDesktopVersion
+    ? `${copy.updateAvailableLabel} · v${remoteDesktopVersion}`
+    : copy.updateAvailableLabel;
   const configured = setupInfo?.configured ?? false;
   const isReady = gatewayStatus?.running ?? false;
   const isOllamaReady = ollamaStatus?.running ?? false;
@@ -1226,6 +1337,18 @@ export default function App() {
   );
   const shouldShowLocalDownloadProgress =
     isBackgroundDownloadRunning || hasPendingLocalDownload;
+  const gatewayStateInput = {
+    configured,
+    isStartingGateway,
+    isStoppingGateway,
+    isResettingOpenClaw,
+    configuredCurrentModelRequiresExistingLocalModel,
+    configuredCurrentModelName,
+    configuredLocalModelExists,
+    localModelRunProgress,
+  };
+  const gatewayStartState = getGatewayStartState(gatewayStateInput);
+  const gatewayStatusCardState = getGatewayStatusCardState(gatewayStateInput);
   const openClawModelsByProvider = useMemo(() => {
     const grouped = new Map<string, ModelCatalogEntry[]>();
     for (const entry of openclawModels) {
@@ -1350,9 +1473,7 @@ export default function App() {
       ? localModelRunProgress?.model.trim() || pendingLocalDownloadModel.trim()
       : "";
 
-    return availableModels.filter(
-      (model) => model.trim() !== hiddenDownloadingModel,
-    );
+    return filterVisibleLocalModels(availableModels, hiddenDownloadingModel);
   }, [
     availableModels,
     localModelRunProgress,
@@ -1427,7 +1548,10 @@ export default function App() {
     );
   };
 
-  const refreshMainState = async (language: LauncherLanguage) => {
+  const refreshMainState = async (
+    language: LauncherLanguage,
+    progressOverride: LocalModelRunProgress | null = localModelRunProgress,
+  ) => {
     const [nextSetupInfo, nextGatewayStatus, nextOllamaStatus] =
       await Promise.all([
         invoke<SetupInfo>("read_setup_info"),
@@ -1473,8 +1597,34 @@ export default function App() {
       return;
     }
     if (
+      isDownloadingRequiredLocalModel(
+        nextRequiresExistingLocalModel,
+        nextLocalModelName,
+        nextConfiguredLocalModelExists,
+        progressOverride,
+      )
+    ) {
+      showStatusMessage(
+        copyByLanguage[language].statusStartGatewayWaitForModelDownload(
+          nextLocalModelName,
+        ),
+        {
+          action: "refreshMainState",
+          reason: "configured_local_model_downloading",
+          localModelName: nextLocalModelName,
+        },
+        "INFO",
+      );
+      return;
+    }
+    if (
       nextRequiresExistingLocalModel &&
-      nextConfiguredLocalModelExists === false
+      !isRequiredLocalModelAvailableForGateway({
+        configuredCurrentModelRequiresExistingLocalModel: nextRequiresExistingLocalModel,
+        configuredCurrentModelName: nextLocalModelName,
+        configuredLocalModelExists: nextConfiguredLocalModelExists,
+        localModelRunProgress: progressOverride,
+      })
     ) {
       showStatusMessage(
         copyByLanguage[language].statusStartGatewayRequiresLocalModel,
@@ -1506,6 +1656,7 @@ export default function App() {
         );
         setPreferences(nextPreferences);
         setSelectedLanguage(nextPreferences.language);
+        void ensureRemoteSkillCatalogFresh();
 
         if (nextPreferences.isInitialized) {
           await refreshMainState(nextPreferences.language);
@@ -1546,6 +1697,24 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    setActiveNotificationIndex(0);
+  }, [selectedLanguage, remoteNotifications]);
+
+  useEffect(() => {
+    if (visibleNotifications.length <= 1) return;
+
+    const timer = window.setInterval(() => {
+      setActiveNotificationIndex((current) =>
+        (current + 1) % visibleNotifications.length,
+      );
+    }, 3000);
+
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [visibleNotifications]);
+
+  useEffect(() => {
     void (async () => {
       try {
         const info = await invoke<SystemMemoryInfo>("get_system_memory_info");
@@ -1581,6 +1750,8 @@ export default function App() {
     hasInitializedRecommendedLocalModelRef.current = true;
   }, [defaultRecommendedLocalModelName, hasResolvedRecommendedLocalModel]);
 
+  const previousLocalModelRunProgressRef = useRef<LocalModelRunProgress | null>(null);
+
   useEffect(() => {
     if (screen !== "main") return;
 
@@ -1591,7 +1762,41 @@ export default function App() {
           "get_local_model_run_progress",
         );
         if (cancelled) return;
+        const previousProgress = previousLocalModelRunProgressRef.current;
         setLocalModelRunProgress(progress);
+        previousLocalModelRunProgressRef.current = progress;
+        if (
+          shouldRefreshAfterLocalModelDownload({
+            previousProgress,
+            nextProgress: progress,
+            configuredCurrentModelRequiresExistingLocalModel,
+            configuredCurrentModelName,
+          })
+        ) {
+          setConfiguredLocalModelExists(true);
+          void refreshMainState(selectedLanguage, progress);
+        }
+        if (
+          isDownloadingRequiredLocalModel(
+            configuredCurrentModelRequiresExistingLocalModel,
+            configuredCurrentModelName,
+            configuredLocalModelExists,
+            progress,
+          )
+        ) {
+          showStatusMessage(
+            copyByLanguage[selectedLanguage].statusStartGatewayWaitForModelDownload(
+              configuredCurrentModelName || progress.model,
+            ),
+            {
+              action: "pollLocalModelRunProgress",
+              reason: "configured_local_model_downloading",
+              progress,
+            },
+            "INFO",
+          );
+          return;
+        }
         if (!progress.running && progress.message.trim().length > 0) {
           showStatusMessage(progress.message, {
             action: "pollLocalModelRunProgress",
@@ -1612,7 +1817,13 @@ export default function App() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [screen]);
+  }, [
+    configuredCurrentModelName,
+    configuredCurrentModelRequiresExistingLocalModel,
+    configuredLocalModelExists,
+    screen,
+    selectedLanguage,
+  ]);
 
   useEffect(() => {
     if (screen !== "main" || mainNav !== "overview") return;
@@ -1788,6 +1999,7 @@ export default function App() {
   };
 
   const handleContinueQqStep = async () => {
+    if (isApplyingInitialSetup) return;
     if (wantsQqChannel === null) return;
     if (
       wantsQqChannel &&
@@ -1796,6 +2008,7 @@ export default function App() {
       return;
 
     const request: InitialSetupConfigRequest = {};
+    setIsApplyingInitialSetup(true);
     try {
       if (wantsLocalModel) {
         request.localModel = localModelName.trim();
@@ -1832,6 +2045,8 @@ export default function App() {
         action: "handleContinueQqStep",
         phase: "refreshMainState",
       });
+    } finally {
+      setIsApplyingInitialSetup(false);
     }
   };
 
@@ -1940,12 +2155,12 @@ export default function App() {
     }
   };
 
-  const handleOpenOfficialWebsite = async () => {
+  const handleOpenWhereClawWebsite = async () => {
     try {
       await invoke("open_external_url", { url: "https://whereclaw.com" });
     } catch (error) {
       showStatusError(error, copy.openUiFailed, {
-        action: "handleOpenOfficialWebsite",
+        action: "handleOpenWhereClawWebsite",
         url: "https://whereclaw.com",
       });
     }
@@ -2140,12 +2355,12 @@ export default function App() {
     if (skillCatalog) return;
     setIsSkillCatalogLoading(true);
     try {
-      const response = await fetch(skillsCatalogUrl);
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-      }
-      const catalog = (await response.json()) as SkillCatalog;
-      setSkillCatalog(catalog);
+      await ensureRemoteSkillCatalogFresh();
+      const payload = await invoke<ActiveSkillCatalogPayload>(
+        "read_active_skill_catalog",
+      );
+      setSkillCatalog(payload.catalog);
+      setSkillsCatalogVersion(payload.version);
     } catch (error) {
       showStatusError(error, copy.loadSkillCatalogFailed, {
         action: "loadSkillCatalog",
@@ -2285,9 +2500,26 @@ export default function App() {
       });
       return;
     }
+    if (gatewayStartState.showDownloadHint) {
+      showStatusMessage(
+        copy.statusStartGatewayWaitForModelDownload(configuredCurrentModelName),
+        {
+          action: "handleStartGateway",
+          reason: "configured_local_model_downloading",
+          configuredCurrentModelName,
+        },
+        "INFO",
+      );
+      return;
+    }
     if (
       configuredCurrentModelRequiresExistingLocalModel &&
-      configuredLocalModelExists === false
+      !isRequiredLocalModelAvailableForGateway({
+        configuredCurrentModelRequiresExistingLocalModel,
+        configuredCurrentModelName,
+        configuredLocalModelExists,
+        localModelRunProgress,
+      })
     ) {
       showStatusMessage(copy.statusStartGatewayRequiresLocalModel, {
         action: "handleStartGateway",
@@ -2687,10 +2919,12 @@ export default function App() {
   }
 
   if (screen === "model") {
-    const disableContinue =
-      wantsLocalModel === null ||
-      isValidatingLocalModelName ||
-      (wantsLocalModel && localModelName.trim().length === 0);
+    const modelStepUiState = getModelStepUiState({
+      wantsLocalModel,
+      localModelName,
+      isValidatingLocalModelName,
+    });
+    const disableContinue = modelStepUiState.disableContinue;
 
     return (
       <main className={appFrameClass}>
@@ -2722,6 +2956,12 @@ export default function App() {
                 {copy.no}
               </button>
             </div>
+
+            {modelStepUiState.showNoLocalModelHint ? (
+              <div className="mt-5 rounded-[1.1rem] border border-sky-200 bg-sky-50/80 p-4 text-left text-sm leading-6 text-sky-900">
+                {copy.modelNoLocalHint}
+              </div>
+            ) : null}
 
             {wantsLocalModel ? (
               <div className="mt-5 space-y-3">
@@ -2791,10 +3031,13 @@ export default function App() {
   }
 
   if (screen === "qq") {
-    const disableContinue =
-      wantsQqChannel === null ||
-      (wantsQqChannel &&
-        (qqAppId.trim().length === 0 || qqAppSecret.trim().length === 0));
+    const qqContinueButtonState = getQqContinueButtonState({
+      wantsQqChannel,
+      qqAppId,
+      qqAppSecret,
+      isApplyingInitialSetup,
+    });
+    const disableContinue = qqContinueButtonState.disabled;
 
     return (
       <main className={appFrameClass}>
@@ -2812,6 +3055,7 @@ export default function App() {
                     ? choiceButtonActiveClass
                     : choiceButtonInactiveClass
                 }`}
+                disabled={isApplyingInitialSetup}
                 onClick={() => setWantsQqChannel(true)}
                 type="button"
               >
@@ -2823,6 +3067,7 @@ export default function App() {
                     ? choiceButtonActiveClass
                     : choiceButtonInactiveClass
                 }`}
+                disabled={isApplyingInitialSetup}
                 onClick={() => setWantsQqChannel(false)}
                 type="button"
               >
@@ -2861,6 +3106,7 @@ export default function App() {
                     </label>
                     <input
                       className={`mt-2 ${inputClass}`}
+                      disabled={isApplyingInitialSetup}
                       onChange={(event) => setQqAppId(event.target.value)}
                       type="text"
                       value={qqAppId}
@@ -2872,6 +3118,7 @@ export default function App() {
                     </label>
                     <input
                       className={`mt-2 ${inputClass}`}
+                      disabled={isApplyingInitialSetup}
                       onChange={(event) => setQqAppSecret(event.target.value)}
                       type="text"
                       value={qqAppSecret}
@@ -2892,6 +3139,7 @@ export default function App() {
             <button
               aria-label={copy.backAriaLabel}
               className={iconButtonClass}
+              disabled={isApplyingInitialSetup}
               onClick={() => {
                 clearStatusMessage({
                   action: "navigateBackFromQqScreen",
@@ -2904,13 +3152,22 @@ export default function App() {
               <ChevronLeftIcon />
             </button>
             <button
-              aria-label={copy.nextAriaLabel}
+              aria-busy={qqContinueButtonState.showLoading}
+              aria-label={
+                qqContinueButtonState.showLoading
+                  ? copy.loading
+                  : copy.nextAriaLabel
+              }
               className={iconButtonClass}
               disabled={disableContinue}
               onClick={() => void handleContinueQqStep()}
               type="button"
             >
-              <ChevronRightIcon />
+              {qqContinueButtonState.showLoading ? (
+                <SpinnerIcon />
+              ) : (
+                <ChevronRightIcon />
+              )}
             </button>
           </div>
         </div>
@@ -2921,6 +3178,14 @@ export default function App() {
   return (
     <main className={appFrameClass}>
       <div className="mx-auto flex h-[calc(100dvh-2rem)] w-full max-w-6xl flex-col gap-3 p-4 sm:h-[calc(100dvh-2.5rem)] sm:p-5 lg:h-[calc(100dvh-3rem)] lg:p-6">
+        {activeNotification ? (
+          <p
+            className="pl-4 text-left text-[0.72rem] leading-5 text-slate-500 sm:pl-5"
+            key={`${selectedLanguage}-${activeNotificationIndex}`}
+          >
+            {activeNotification}
+          </p>
+        ) : null}
         <div className="grid min-h-0 flex-1 gap-4 lg:grid-cols-[16rem_minmax(0,1fr)]">
           <aside className="flex h-full flex-col rounded-3xl bg-white/72 p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.9)] backdrop-blur-2xl sm:p-5">
             <div>
@@ -2931,9 +3196,20 @@ export default function App() {
                   src="/WhereClaw-logo.png"
                 />
               </div>
-              <p className="mt-1 text-center text-sm text-slate-500">
-                {consoleVersionLabel}
-              </p>
+              <div className="mt-1 flex items-center justify-center gap-1.5 text-sm text-slate-500">
+                <p>{consoleVersionLabel}</p>
+                {hasDesktopUpdate ? (
+                  <button
+                    aria-label={desktopUpdateTitle}
+                    className="inline-flex h-5 w-5 items-center justify-center text-emerald-600 transition hover:text-emerald-700"
+                    onClick={() => void handleOpenWhereClawWebsite()}
+                    title={desktopUpdateTitle}
+                    type="button"
+                  >
+                    <UpdateAvailableIcon />
+                  </button>
+                ) : null}
+              </div>
             </div>
 
             <nav className="mt-6 space-y-2">
@@ -3053,7 +3329,7 @@ export default function App() {
               <button
                 aria-label={copy.officialWebsiteLabel}
                 className={bottomNavIconButtonClass}
-                onClick={() => void handleOpenOfficialWebsite()}
+                onClick={() => void handleOpenWhereClawWebsite()}
                 title={copy.officialWebsiteLabel}
                 type="button"
               >
@@ -3250,15 +3526,18 @@ export default function App() {
                         </p>
                       </div>
 
+                      {gatewayStatusCardState.showDownloadHintInCard ? (
+                        <div className="mt-5 rounded-[1.1rem] border border-amber-200 bg-amber-50/85 p-4 text-sm leading-6 text-amber-900">
+                          {copy.statusStartGatewayWaitForModelDownload(
+                            configuredCurrentModelName || activeModelName,
+                          )}
+                        </div>
+                      ) : null}
+
                       <div className="mt-5 grid gap-3 sm:grid-cols-2">
                         <button
                           className={secondaryButtonClass}
-                          disabled={
-                            !configured ||
-                            isStartingGateway ||
-                            isStoppingGateway ||
-                            isResettingOpenClaw
-                          }
+                          disabled={gatewayStartState.disabled}
                           onClick={() => {
                             if (isReady) {
                               void handleOpenControlUi();
@@ -3667,7 +3946,10 @@ export default function App() {
                             ) : (
                               visibleLocalModels.map((model) => {
                                 const isActive =
-                                  model.trim() === pendingLocalModelSelection;
+                                  areLocalModelNamesEquivalent(
+                                    model,
+                                    pendingLocalModelSelection,
+                                  );
                                 return (
                                   <button
                                     key={model}
@@ -3697,8 +3979,10 @@ export default function App() {
                                 pendingLocalModelSelection.trim().length ===
                                   0 ||
                                 (isLocalModelEnabled &&
-                                  pendingLocalModelSelection.trim() ===
-                                    configuredLocalModelName) ||
+                                  !hasLocalModelSelectionChanged(
+                                    pendingLocalModelSelection,
+                                    configuredLocalModelName,
+                                  )) ||
                                 isSavingLocalModelSelection
                               }
                               onClick={() =>
@@ -4237,6 +4521,11 @@ export default function App() {
                       <p className="mt-1 text-xs text-slate-500">
                         {copy.skillCatalogDescription}
                       </p>
+                      {skillsCatalogVersion ? (
+                        <p className="text-xs text-slate-400">
+                          {copy.versionPrefix}: {skillsCatalogVersion} · {copy.skillCatalogSource}
+                        </p>
+                      ) : null}
                     </div>
 
                     <section className="rounded-3xl border border-white/85 bg-white/70 p-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.9)] backdrop-blur-xl">
@@ -6074,6 +6363,34 @@ function TerminalIcon() {
         d="M12.5 14H16.5"
         stroke="currentColor"
         strokeLinecap="round"
+        strokeWidth="1.8"
+      />
+    </svg>
+  );
+}
+
+function UpdateAvailableIcon() {
+  return (
+    <svg aria-hidden="true" className="h-5 w-5" fill="none" viewBox="0 0 24 24">
+      <path
+        d="M12 4V14"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="1.8"
+      />
+      <path
+        d="M8.5 10.5L12 14L15.5 10.5"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="1.8"
+      />
+      <path
+        d="M5 16.5V17C5 18.1046 5.89543 19 7 19H17C18.1046 19 19 18.1046 19 17V16.5"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
         strokeWidth="1.8"
       />
     </svg>

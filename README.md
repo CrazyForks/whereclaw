@@ -2,16 +2,16 @@
 
 WhereClaw is a Tauri desktop application with a React frontend and a bundled `whereclaw-engine` runtime.
 
-## Supported CI build targets
+## Supported local build targets
 
-GitHub Actions validates native builds for these targets on every `push` and `pull_request`:
+Use the local packaging scripts for these targets:
 
 - macOS Apple Silicon
 - macOS Intel
 - Windows x64
 - Linux x64
 
-Only version tags matching `v*` publish release assets.
+GitHub Actions auto build is disabled. Use the local packaging scripts in `scripts/`.
 
 ## Local development
 
@@ -41,30 +41,23 @@ npm run prepare:openclaw-engine:windows
 
 ## CI release flow
 
-- `push` / `pull_request`: builds all supported platforms and uploads workflow artifacts for inspection
-- `push` of a tag like `v1.0.0`: builds all supported platforms and publishes release bundles to GitHub Releases
+- Run the platform-specific script on each target machine to build local release artifacts.
+- Built artifacts are written to `release-artifacts/<platform>/`.
 
 ## Notes
 
-- macOS builds are currently ad-hoc re-signed in CI so they avoid the broken-bundle state, but they are still not Apple-notarized.
-- Windows builds are currently published as portable `.zip` bundles instead of installer `.exe` packages.
-- Linux runners install WebKit/AppImage packaging dependencies before running `tauri build`.
-- The bundled engine runtime is platform-specific and prepared inside CI before packaging.
+- macOS packaging scripts perform ad-hoc re-signing so the app bundle is structurally valid, but they do not notarize the app.
+- Windows packaging currently produces a portable `.zip` bundle instead of an installer.
+- Linux packaging assumes the required WebKit/AppImage dependencies are already installed on that machine.
+- The bundled engine runtime is platform-specific and prepared locally before packaging.
 
-## macOS signing secrets
+## Local packaging scripts
 
-To avoid Gatekeeper treating downloaded macOS builds as broken or untrusted, configure these GitHub Actions secrets before shipping releases:
+Run these on the matching local machine:
 
-- `APPLE_SIGNING_IDENTITY`
-- `APPLE_CERTIFICATE`
-- `APPLE_CERTIFICATE_PASSWORD`
-- `APPLE_API_KEY`
-- `APPLE_API_KEY_P8`
-- `APPLE_API_ISSUER`
+- macOS Apple Silicon: `./scripts/package-macos-arm64.sh`
+- macOS Intel: `./scripts/package-macos-x64.sh`
+- Windows x64 (PowerShell): `./scripts/package-windows-x64.ps1`
+- Linux x64: `./scripts/package-linux-x64.sh`
 
-Alternatively, notarization can use Apple ID credentials:
-
-- `APPLE_ID`
-- `APPLE_PASSWORD`
-- `APPLE_TEAM_ID`
-- `APPLE_PROVIDER_SHORT_NAME` (only when needed)
+Artifacts are copied into `release-artifacts/` under a per-platform folder.

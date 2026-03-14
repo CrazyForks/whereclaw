@@ -8,7 +8,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     process::{Child as StdChild, Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -18,12 +18,15 @@ use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sysinfo::{System, SystemExt};
+use tauri::image::Image;
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{path::BaseDirectory, AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 use url::Url;
 use zip::ZipArchive;
 
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
-compile_error!("WhereClaw currently supports only Windows and macOS targets.");
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+compile_error!("WhereClaw currently supports only Windows, macOS, and Linux targets.");
 
 const CONTROL_UI_PORT: u16 = 18_789;
 const OLLAMA_PORT: u16 = 11_434;
@@ -39,6 +42,13 @@ const LAUNCHER_LOG_MAX_BYTES: u64 = 1_048_576;
 const LAUNCHER_LOG_KEEP_FILES: usize = 5;
 const SKILL_DOWNLOAD_URL_TEMPLATE: &str =
     "https://skillhub-1388575217.cos.ap-guangzhou.myqcloud.com/skills/{slug}.zip";
+const REMOTE_SKILLS_MANIFEST_URL: &str = "https://r2.tolearn.cc/manifest.json";
+const REMOTE_SKILLS_DIR_NAME: &str = "remote-skills";
+const REMOTE_SKILLS_FILE_NAME: &str = "skills.json";
+const REMOTE_SKILLS_METADATA_FILE_NAME: &str = "metadata.json";
+const TRAY_ICON_ID: &str = "main";
+const TRAY_MENU_SHOW_ID: &str = "tray_show";
+const TRAY_MENU_QUIT_ID: &str = "tray_quit";
 
 struct GatewayProcess {
     child: Box<dyn PtyChild + Send>,
@@ -58,6 +68,123 @@ struct LocalModelRunState {
     progress: Arc<Mutex<LocalModelRunProgress>>,
     pull_pid: Arc<Mutex<Option<u32>>>,
     stop_requested: Arc<Mutex<bool>>,
+}
+
+struct ExitIntentState {
+    quitting: AtomicBool,
+}
+
+fn show_main_window(app: &AppHandle) -> Result<(), String> {
+    let Some(window) = app.get_webview_window("main") else {
+        return Ok(());
+    };
+
+    window
+        .show()
+        .map_err(|error| format!("failed to show main window: {error}"))?;
+    let _ = window.unminimize();
+    let _ = window.set_focus();
+    Ok(())
+}
+
+fn request_explicit_exit(app: &AppHandle) {
+    if let Some(exit_intent) = app.try_state::<ExitIntentState>() {
+        exit_intent.quitting.store(true, Ordering::SeqCst);
+    }
+    app.exit(0);
+}
+
+fn install_tray(app: &AppHandle) -> Result<(), String> {
+    let show_item = MenuItem::with_id(app, TRAY_MENU_SHOW_ID, "显示主窗口", true, None::<&str>)
+        .map_err(|error| format!("failed to create tray show menu item: {error}"))?;
+    let quit_item = MenuItem::with_id(app, TRAY_MENU_QUIT_ID, "退出", true, None::<&str>)
+        .map_err(|error| format!("failed to create tray quit menu item: {error}"))?;
+    let menu = Menu::with_items(app, &[&show_item, &quit_item])
+        .map_err(|error| format!("failed to create tray menu: {error}"))?;
+
+    let mut tray_builder = TrayIconBuilder::with_id(TRAY_ICON_ID).menu(&menu);
+    if let Some(icon) = app.default_window_icon().cloned() {
+        tray_builder = tray_builder.icon(Image::new(icon.rgba(), icon.width(), icon.height()));
+    }
+
+    tray_builder
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            TRAY_MENU_SHOW_ID => {
+                let _ = show_main_window(app);
+            }
+            TRAY_MENU_QUIT_ID => {
+                request_explicit_exit(app);
+            }
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                let _ = show_main_window(tray.app_handle());
+            }
+        })
+        .build(app)
+        .map_err(|error| format!("failed to build tray icon: {error}"))?;
+
+    Ok(())
+}
+
+fn cleanup_processes_on_exit(app: &AppHandle) -> Result<(), String> {
+    if let Some(gateway_state) = app.try_state::<GatewayState>() {
+        let mut child_slot = gateway_state
+            .child
+            .lock()
+            .map_err(|_| String::from("failed to acquire gateway state lock during exit"))?;
+
+        let running_pid = child_slot.as_mut().map(|process| process.child.process_id());
+
+        if let Some(mut process) = child_slot.take() {
+            process
+                .child
+                .kill()
+                .map_err(|error| format!("failed to stop gateway process during exit: {error}"))?;
+            let _ = process.child.wait();
+        }
+
+        if let Some(window) = app.get_webview_window(CONTROL_UI_WINDOW_LABEL) {
+            let _ = window.close();
+        }
+
+        let _ = append_launcher_log(
+            app,
+            "INFO",
+            &format!("exit cleanup completed for gateway pid={running_pid:?}"),
+        );
+    }
+
+    if let Some(ollama_state) = app.try_state::<OllamaState>() {
+        let mut child_slot = ollama_state
+            .child
+            .lock()
+            .map_err(|_| String::from("failed to acquire ollama state lock during exit"))?;
+
+        let running_pid = child_slot.as_ref().map(StdChild::id);
+
+        if let Some(mut process) = child_slot.take() {
+            process
+                .kill()
+                .map_err(|error| format!("failed to stop ollama process during exit: {error}"))?;
+            let _ = process.wait();
+        }
+
+        let _ = append_launcher_log(
+            app,
+            "INFO",
+            &format!("exit cleanup completed for ollama pid={running_pid:?}"),
+        );
+    }
+
+    Ok(())
 }
 
 #[derive(Clone, Serialize)]
@@ -144,6 +271,89 @@ struct InstalledSkillEntry {
     enabled: bool,
 }
 
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BundledVersionManifest {
+    skills_catalog_version: String,
+}
+
+#[derive(Clone, Deserialize)]
+struct RemoteManifest {
+    skills: Option<RemoteSkillsManifest>,
+    desktop: Option<RemoteDesktopManifest>,
+    notifications: Option<RemoteNotificationsManifest>,
+}
+
+#[derive(Clone, Deserialize)]
+struct RemoteSkillsManifest {
+    version: String,
+    url: String,
+}
+
+#[derive(Clone, Deserialize)]
+struct RemoteDesktopManifest {
+    version: String,
+}
+
+#[derive(Clone, Deserialize)]
+struct RemoteNotificationsManifest {
+    #[serde(default)]
+    cn: Vec<String>,
+    #[serde(default)]
+    en: Vec<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct CachedSkillCatalogMetadata {
+    version: String,
+    url: String,
+    #[serde(default)]
+    desktop_version: Option<String>,
+    #[serde(default = "empty_cached_notifications")]
+    notifications: CachedNotifications,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct CachedNotifications {
+    cn: Vec<String>,
+    en: Vec<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ActiveSkillCatalogPayload {
+    version: String,
+    source: String,
+    catalog: Value,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SkillCatalogRefreshResult {
+    version: String,
+    source: String,
+    updated: bool,
+    desktop_version: Option<String>,
+    desktop_update_available: bool,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteNotificationsPayload {
+    cn: Vec<String>,
+    en: Vec<String>,
+    source: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteDesktopVersionPayload {
+    version: Option<String>,
+    update_available: bool,
+    source: String,
+}
+
 fn collect_system_memory_info() -> Result<SystemMemoryInfo, String> {
     let mut system = System::new();
     system.refresh_memory();
@@ -153,6 +363,83 @@ fn collect_system_memory_info() -> Result<SystemMemoryInfo, String> {
         total_ram_bytes,
         gpu_total_bytes,
     })
+}
+
+
+fn parse_bundled_version_manifest() -> Result<BundledVersionManifest, String> {
+    serde_json::from_str(include_str!("../../VERSION.json"))
+        .map_err(|error| format!("failed to parse bundled VERSION.json: {error}"))
+}
+
+fn read_bundled_skill_catalog() -> Result<ActiveSkillCatalogPayload, String> {
+    let version_manifest = parse_bundled_version_manifest()?;
+    let catalog = serde_json::from_str(include_str!("../../skills.json"))
+        .map_err(|error| format!("failed to parse bundled skills.json: {error}"))?;
+
+    Ok(ActiveSkillCatalogPayload {
+        version: version_manifest.skills_catalog_version,
+        source: String::from("bundled"),
+        catalog,
+    })
+}
+
+fn current_desktop_version(app: &AppHandle) -> String {
+    app.package_info().version.to_string()
+}
+
+fn is_remote_desktop_version_newer(
+    remote_version: Option<&str>,
+    current_version: &str,
+) -> bool {
+    let Some(remote_version) = remote_version.map(str::trim).filter(|value| !value.is_empty()) else {
+        return false;
+    };
+
+    is_remote_version_newer(remote_version, current_version).unwrap_or(false)
+}
+
+fn empty_cached_notifications() -> CachedNotifications {
+    CachedNotifications {
+        cn: Vec::new(),
+        en: Vec::new(),
+    }
+}
+
+fn parse_semver_triplet(version: &str) -> Result<(u64, u64, u64), String> {
+    let normalized = version
+        .trim()
+        .split_once('-')
+        .map(|(value, _)| value)
+        .unwrap_or(version.trim())
+        .split_once('+')
+        .map(|(value, _)| value)
+        .unwrap_or(version.trim());
+    let mut parts = normalized.split('.');
+    let major = parts
+        .next()
+        .ok_or_else(|| format!("invalid semver version: {version}"))?
+        .parse::<u64>()
+        .map_err(|error| format!("invalid semver major component in {version}: {error}"))?;
+    let minor = parts
+        .next()
+        .ok_or_else(|| format!("invalid semver version: {version}"))?
+        .parse::<u64>()
+        .map_err(|error| format!("invalid semver minor component in {version}: {error}"))?;
+    let patch = parts
+        .next()
+        .ok_or_else(|| format!("invalid semver version: {version}"))?
+        .parse::<u64>()
+        .map_err(|error| format!("invalid semver patch component in {version}: {error}"))?;
+
+    if parts.next().is_some() {
+        return Err(format!("invalid semver version: {version}"));
+    }
+
+    Ok((major, minor, patch))
+}
+
+fn is_remote_version_newer(remote: &str, current: &str) -> Result<bool, String> {
+    Ok(parse_semver_triplet(remote)? > parse_semver_triplet(current)?)
 }
 
 #[cfg(target_os = "macos")]
@@ -563,12 +850,14 @@ async fn check_local_model_exists(
     let app = app.clone();
     let child = state.child.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let normalized_model = model.trim().to_string();
+        let normalized_model = normalize_ollama_model_name_for_lookup(&model);
         if normalized_model.is_empty() {
             return Ok(false);
         }
         let models = list_ollama_models_impl(&app, &child)?;
-        Ok(models.iter().any(|existing| existing == &normalized_model))
+        Ok(models.iter().any(|existing| {
+            normalize_ollama_model_name_for_lookup(existing) == normalized_model
+        }))
     })
     .await
     .map_err(|error| format!("failed to join local-model-exists task: {error}"))?
@@ -785,6 +1074,170 @@ fn open_openclaw_config_file(app: AppHandle) -> Result<(), String> {
     open_path_in_default_app(&config_path)
 }
 
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn whereclaw_cmd_escape(value: &str) -> String {
+    value.replace('^', "^^")
+}
+
+fn whereclaw_terminal_hint_message() -> &'static str {
+    "Bundled commands: node, npm, npx, openclaw, ollama"
+}
+
+fn build_whereclaw_terminal_openclaw_wrapper_script(node_binary: &str, entry_script: &str) -> String {
+    format!(
+        "#!/bin/zsh
+\"{node}\" \"{entry}\" \"$@\"
+",
+        node = node_binary,
+        entry = entry_script,
+    )
+}
+
+fn build_whereclaw_terminal_ollama_wrapper_script(
+    ollama_binary: &str,
+    ollama_models_dir: &str,
+) -> String {
+    format!(
+        "#!/bin/zsh
+export OLLAMA_HOST={host}
+export OLLAMA_MODELS={models}
+\"{binary}\" \"$@\"
+",
+        host = shell_single_quote(OLLAMA_HOST),
+        models = shell_single_quote(ollama_models_dir),
+        binary = ollama_binary,
+    )
+}
+
+fn build_whereclaw_terminal_shell_rc(
+    openclaw_home: &str,
+    config_path: &str,
+    tmp_dir: &str,
+    npm_cache_dir: &str,
+    npm_prefix_dir: &str,
+    corepack_home_dir: &str,
+    terminal_bin_dir: &str,
+    runtime_bin_dir: &str,
+    package_root: &str,
+    npm_registry_exports: &str,
+    ollama_models_dir: &str,
+) -> String {
+    format!(
+        "export OPENCLAW_HOME={home}
+export OPENCLAW_STATE_DIR={home}
+export OPENCLAW_CONFIG_PATH={config}
+export TMPDIR={tmp}
+export NPM_CONFIG_CACHE={npm_cache}
+export npm_config_cache={npm_cache}
+export NPM_CONFIG_PREFIX={npm_prefix}
+export npm_config_prefix={npm_prefix}
+export COREPACK_HOME={corepack_home}
+export OLLAMA_HOST={ollama_host}
+export OLLAMA_MODELS={ollama_models}
+export PATH={terminal_bin}:{runtime_bin}:$PATH
+{npm_registry}cd {package_root}
+echo {banner}
+echo {hint}
+echo
+",
+        home = shell_single_quote(openclaw_home),
+        config = shell_single_quote(config_path),
+        tmp = shell_single_quote(tmp_dir),
+        npm_cache = shell_single_quote(npm_cache_dir),
+        npm_prefix = shell_single_quote(npm_prefix_dir),
+        corepack_home = shell_single_quote(corepack_home_dir),
+        ollama_host = shell_single_quote(OLLAMA_HOST),
+        ollama_models = shell_single_quote(ollama_models_dir),
+        terminal_bin = shell_single_quote(terminal_bin_dir),
+        runtime_bin = shell_single_quote(runtime_bin_dir),
+        npm_registry = npm_registry_exports,
+        package_root = shell_single_quote(package_root),
+        banner = shell_single_quote("WhereClaw terminal is ready."),
+        hint = shell_single_quote(whereclaw_terminal_hint_message()),
+    )
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn build_whereclaw_terminal_windows_openclaw_wrapper_script(
+    node_binary: &str,
+    entry_script: &str,
+) -> String {
+    format!(
+        "@echo off
+\"{node}\" \"{entry}\" %*
+",
+        node = node_binary,
+        entry = entry_script,
+    )
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn build_whereclaw_terminal_windows_ollama_wrapper_script(
+    ollama_binary: &str,
+    ollama_models_dir: &str,
+) -> String {
+    format!(
+        "@echo off
+set OLLAMA_HOST={host}
+set OLLAMA_MODELS={models}
+\"{binary}\" %*
+",
+        host = OLLAMA_HOST,
+        models = whereclaw_cmd_escape(ollama_models_dir),
+        binary = ollama_binary,
+    )
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn build_whereclaw_terminal_windows_script(
+    openclaw_home: &str,
+    config_path: &str,
+    tmp_dir: &str,
+    npm_cache_dir: &str,
+    npm_prefix_dir: &str,
+    corepack_home_dir: &str,
+    terminal_bin_dir: &str,
+    runtime_bin_dir: &str,
+    package_root: &str,
+    npm_registry_commands: &str,
+    ollama_models_dir: &str,
+) -> String {
+    format!(
+        "@echo off
+set OPENCLAW_HOME={home}
+set OPENCLAW_STATE_DIR={home}
+set OPENCLAW_CONFIG_PATH={config}
+set TMPDIR={tmp}
+set NPM_CONFIG_CACHE={npm_cache}
+set npm_config_cache={npm_cache}
+set NPM_CONFIG_PREFIX={npm_prefix}
+set npm_config_prefix={npm_prefix}
+set COREPACK_HOME={corepack_home}
+set OLLAMA_HOST={ollama_host}
+set OLLAMA_MODELS={ollama_models}
+set PATH={terminal_bin};{runtime_bin};%PATH%
+{npm_registry}cd /d {package_root}
+echo WhereClaw terminal is ready.
+echo {hint}
+echo.
+%ComSpec% /K
+",
+        home = whereclaw_cmd_escape(openclaw_home),
+        config = whereclaw_cmd_escape(config_path),
+        tmp = whereclaw_cmd_escape(tmp_dir),
+        npm_cache = whereclaw_cmd_escape(npm_cache_dir),
+        npm_prefix = whereclaw_cmd_escape(npm_prefix_dir),
+        corepack_home = whereclaw_cmd_escape(corepack_home_dir),
+        ollama_host = OLLAMA_HOST,
+        ollama_models = whereclaw_cmd_escape(ollama_models_dir),
+        terminal_bin = whereclaw_cmd_escape(terminal_bin_dir),
+        runtime_bin = whereclaw_cmd_escape(runtime_bin_dir),
+        npm_registry = npm_registry_commands,
+        package_root = whereclaw_cmd_escape(package_root),
+        hint = whereclaw_terminal_hint_message(),
+    )
+}
+
 #[tauri::command]
 fn open_whereclaw_terminal(app: AppHandle) -> Result<(), String> {
     let launcher_preferences = read_launcher_preferences_impl(&app)?;
@@ -797,6 +1250,8 @@ fn open_whereclaw_terminal(app: AppHandle) -> Result<(), String> {
     let engine_dir = resolve_engine_dir(&app)?;
     let node_binary = resolve_node_binary(&engine_dir)?;
     let runtime_bin_dir = resolve_runtime_bin_dir(&engine_dir)?;
+    let ollama_binary = initialize_ollama_runtime(&app, &engine_dir)?;
+    let ollama_models_dir = resolve_ollama_models_dir(&app)?;
     let entry_script = resolve_openclaw_entry(&engine_dir)?;
     let openclaw_package_root = resolve_openclaw_package_root(&entry_script)?;
     let openclaw_home = initialize_openclaw_home(&app, &engine_dir)?;
@@ -821,10 +1276,9 @@ fn open_whereclaw_terminal(app: AppHandle) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         let openclaw_wrapper_path = terminal_bin_dir.join("openclaw");
-        let openclaw_wrapper = format!(
-            "#!/bin/zsh\n\"{node}\" \"{entry}\" \"$@\"\n",
-            node = node_binary.display(),
-            entry = entry_script.display(),
+        let openclaw_wrapper = build_whereclaw_terminal_openclaw_wrapper_script(
+            &node_binary.display().to_string(),
+            &entry_script.display().to_string(),
         );
         fs::write(&openclaw_wrapper_path, openclaw_wrapper)
             .map_err(|error| format!("failed to write WhereClaw terminal wrapper: {error}"))?;
@@ -836,25 +1290,38 @@ fn open_whereclaw_terminal(app: AppHandle) -> Result<(), String> {
                 format!("failed to mark WhereClaw terminal wrapper executable: {error}")
             })?;
 
+        let ollama_wrapper_path = terminal_bin_dir.join("ollama");
+        let ollama_wrapper = build_whereclaw_terminal_ollama_wrapper_script(
+            &ollama_binary.display().to_string(),
+            &ollama_models_dir.display().to_string(),
+        );
+        fs::write(&ollama_wrapper_path, ollama_wrapper)
+            .map_err(|error| format!("failed to write WhereClaw terminal ollama wrapper: {error}"))?;
+        Command::new("chmod")
+            .arg("+x")
+            .arg(&ollama_wrapper_path)
+            .status()
+            .map_err(|error| {
+                format!("failed to mark WhereClaw terminal ollama wrapper executable: {error}")
+            })?;
+
         let shell_home_dir = openclaw_home.join("tmp").join("whereclaw-zdotdir");
         fs::create_dir_all(&shell_home_dir)
             .map_err(|error| format!("failed to create WhereClaw shell home directory: {error}"))?;
         let shell_rc_path = shell_home_dir.join(".zshrc");
         let npm_registry_exports = npm_registry_shell_exports(&launcher_preferences.language);
-        let shell_rc = format!(
-            "export OPENCLAW_HOME={home}\nexport OPENCLAW_STATE_DIR={home}\nexport OPENCLAW_CONFIG_PATH={config}\nexport TMPDIR={tmp}\nexport NPM_CONFIG_CACHE={npm_cache}\nexport npm_config_cache={npm_cache}\nexport NPM_CONFIG_PREFIX={npm_prefix}\nexport npm_config_prefix={npm_prefix}\nexport COREPACK_HOME={corepack_home}\nexport PATH={terminal_bin}:{runtime_bin}:$PATH\n{npm_registry}cd {package_root}\necho {banner}\necho {hint}\necho\n",
-            home = shell_single_quote(&openclaw_home.display().to_string()),
-            config = shell_single_quote(&openclaw_home.join("openclaw.json").display().to_string()),
-            tmp = shell_single_quote(&tmp_dir.display().to_string()),
-            npm_cache = shell_single_quote(&npm_cache_dir.display().to_string()),
-            npm_prefix = shell_single_quote(&npm_prefix_dir.display().to_string()),
-            corepack_home = shell_single_quote(&corepack_home_dir.display().to_string()),
-            terminal_bin = shell_single_quote(&terminal_bin_dir.display().to_string()),
-            runtime_bin = shell_single_quote(&runtime_bin_dir.display().to_string()),
-            npm_registry = npm_registry_exports,
-            package_root = shell_single_quote(&openclaw_package_root.display().to_string()),
-            banner = shell_single_quote("WhereClaw terminal is ready."),
-            hint = shell_single_quote("Bundled commands: node, npm, npx, openclaw"),
+        let shell_rc = build_whereclaw_terminal_shell_rc(
+            &openclaw_home.display().to_string(),
+            &openclaw_home.join("openclaw.json").display().to_string(),
+            &tmp_dir.display().to_string(),
+            &npm_cache_dir.display().to_string(),
+            &npm_prefix_dir.display().to_string(),
+            &corepack_home_dir.display().to_string(),
+            &terminal_bin_dir.display().to_string(),
+            &runtime_bin_dir.display().to_string(),
+            &openclaw_package_root.display().to_string(),
+            &npm_registry_exports,
+            &ollama_models_dir.display().to_string(),
         );
         fs::write(&shell_rc_path, shell_rc)
             .map_err(|error| format!("failed to write WhereClaw terminal environment: {error}"))?;
@@ -884,28 +1351,35 @@ fn open_whereclaw_terminal(app: AppHandle) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
         let openclaw_wrapper_path = terminal_bin_dir.join("openclaw.cmd");
-        let openclaw_wrapper = format!(
-            "@echo off\r\n\"{node}\" \"{entry}\" %*\r\n",
-            node = node_binary.display(),
-            entry = entry_script.display(),
+        let openclaw_wrapper = build_whereclaw_terminal_windows_openclaw_wrapper_script(
+            &node_binary.display().to_string(),
+            &entry_script.display().to_string(),
         );
         fs::write(&openclaw_wrapper_path, openclaw_wrapper)
             .map_err(|error| format!("failed to write WhereClaw terminal wrapper: {error}"))?;
 
+        let ollama_wrapper_path = terminal_bin_dir.join("ollama.cmd");
+        let ollama_wrapper = build_whereclaw_terminal_windows_ollama_wrapper_script(
+            &ollama_binary.display().to_string(),
+            &ollama_models_dir.display().to_string(),
+        );
+        fs::write(&ollama_wrapper_path, ollama_wrapper)
+            .map_err(|error| format!("failed to write WhereClaw terminal ollama wrapper: {error}"))?;
+
         let script_path = openclaw_home.join("tmp").join("whereclaw-terminal.cmd");
         let npm_registry_commands = npm_registry_cmd_exports(&launcher_preferences.language);
-        let script = format!(
-            "@echo off\r\nset OPENCLAW_HOME={home}\r\nset OPENCLAW_STATE_DIR={home}\r\nset OPENCLAW_CONFIG_PATH={config}\r\nset TMPDIR={tmp}\r\nset NPM_CONFIG_CACHE={npm_cache}\r\nset npm_config_cache={npm_cache}\r\nset NPM_CONFIG_PREFIX={npm_prefix}\r\nset npm_config_prefix={npm_prefix}\r\nset COREPACK_HOME={corepack_home}\r\nset PATH={terminal_bin};{runtime_bin};%PATH%\r\n{npm_registry}cd /d {package_root}\r\necho WhereClaw terminal is ready.\r\necho Bundled commands: node, npm, npx, openclaw\r\necho.\r\n%ComSpec% /K\r\n",
-            home = cmd_escape(&openclaw_home.display().to_string()),
-            config = cmd_escape(&openclaw_home.join("openclaw.json").display().to_string()),
-            tmp = cmd_escape(&tmp_dir.display().to_string()),
-            npm_cache = cmd_escape(&npm_cache_dir.display().to_string()),
-            npm_prefix = cmd_escape(&npm_prefix_dir.display().to_string()),
-            corepack_home = cmd_escape(&corepack_home_dir.display().to_string()),
-            terminal_bin = cmd_escape(&terminal_bin_dir.display().to_string()),
-            runtime_bin = cmd_escape(&runtime_bin_dir.display().to_string()),
-            npm_registry = npm_registry_commands,
-            package_root = cmd_escape(&openclaw_package_root.display().to_string()),
+        let script = build_whereclaw_terminal_windows_script(
+            &openclaw_home.display().to_string(),
+            &openclaw_home.join("openclaw.json").display().to_string(),
+            &tmp_dir.display().to_string(),
+            &npm_cache_dir.display().to_string(),
+            &npm_prefix_dir.display().to_string(),
+            &corepack_home_dir.display().to_string(),
+            &terminal_bin_dir.display().to_string(),
+            &runtime_bin_dir.display().to_string(),
+            &openclaw_package_root.display().to_string(),
+            &npm_registry_commands,
+            &ollama_models_dir.display().to_string(),
         );
         fs::write(&script_path, script)
             .map_err(|error| format!("failed to write WhereClaw terminal script: {error}"))?;
@@ -1262,6 +1736,42 @@ async fn read_launcher_preferences(app: AppHandle) -> Result<LauncherPreferences
     tauri::async_runtime::spawn_blocking(move || read_launcher_preferences_impl(&app))
         .await
         .map_err(|error| format!("failed to join preferences read task: {error}"))?
+}
+
+#[tauri::command]
+async fn ensure_remote_skill_catalog_fresh(
+    app: AppHandle,
+) -> Result<SkillCatalogRefreshResult, String> {
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || ensure_remote_skill_catalog_fresh_impl(&app))
+        .await
+        .map_err(|error| format!("failed to join remote skill catalog refresh task: {error}"))?
+}
+
+#[tauri::command]
+async fn read_active_skill_catalog(app: AppHandle) -> Result<ActiveSkillCatalogPayload, String> {
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || read_active_skill_catalog_impl(&app))
+        .await
+        .map_err(|error| format!("failed to join active skill catalog read task: {error}"))?
+}
+
+#[tauri::command]
+async fn read_remote_notifications(app: AppHandle) -> Result<RemoteNotificationsPayload, String> {
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || read_remote_notifications_impl(&app))
+        .await
+        .map_err(|error| format!("failed to join remote notifications read task: {error}"))?
+}
+
+#[tauri::command]
+async fn read_remote_desktop_version(
+    app: AppHandle,
+) -> Result<RemoteDesktopVersionPayload, String> {
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || read_remote_desktop_version_impl(&app))
+        .await
+        .map_err(|error| format!("failed to join remote desktop version read task: {error}"))?
 }
 
 #[tauri::command]
@@ -2150,6 +2660,14 @@ fn list_ollama_models_impl(
     }
 
     Ok(models)
+}
+
+fn normalize_ollama_model_name_for_lookup(model: &str) -> String {
+    let normalized_model = model.trim().to_ascii_lowercase();
+    normalized_model
+        .strip_suffix(":latest")
+        .unwrap_or(&normalized_model)
+        .to_string()
 }
 
 fn normalize_and_validate_ollama_model_name(model: &str) -> Result<&str, String> {
@@ -3082,6 +3600,398 @@ fn resolve_default_openclaw_home_dir(app: &AppHandle) -> Result<PathBuf, String>
 
 fn resolve_launcher_settings_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(resolve_launcher_data_dir(app)?.join("launcher-settings.json"))
+}
+
+fn resolve_remote_skills_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(resolve_launcher_data_dir(app)?.join(REMOTE_SKILLS_DIR_NAME))
+}
+
+fn resolve_remote_skills_catalog_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(resolve_remote_skills_dir(app)?.join(REMOTE_SKILLS_FILE_NAME))
+}
+
+fn resolve_remote_skills_metadata_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(resolve_remote_skills_dir(app)?.join(REMOTE_SKILLS_METADATA_FILE_NAME))
+}
+
+fn read_cached_skill_catalog_metadata(app: &AppHandle) -> Result<Option<CachedSkillCatalogMetadata>, String> {
+    let path = resolve_remote_skills_metadata_path(app)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(&path)
+        .map_err(|error| format!("failed to read cached skills metadata: {error}"))?;
+    let metadata = serde_json::from_str(&text)
+        .map_err(|error| format!("failed to parse cached skills metadata: {error}"))?;
+    Ok(Some(metadata))
+}
+
+fn read_active_skill_catalog_impl(app: &AppHandle) -> Result<ActiveSkillCatalogPayload, String> {
+    let metadata = read_cached_skill_catalog_metadata(app)?;
+    let catalog_path = resolve_remote_skills_catalog_path(app)?;
+
+    if let Some(metadata) = metadata {
+        if catalog_path.exists() {
+            let text = fs::read_to_string(&catalog_path)
+                .map_err(|error| format!("failed to read cached skills catalog: {error}"))?;
+            let catalog = serde_json::from_str(&text)
+                .map_err(|error| format!("failed to parse cached skills catalog: {error}"))?;
+            return Ok(ActiveSkillCatalogPayload {
+                version: metadata.version,
+                source: String::from("cached"),
+                catalog,
+            });
+        }
+    }
+
+    read_bundled_skill_catalog()
+}
+
+fn read_remote_notifications_impl(app: &AppHandle) -> Result<RemoteNotificationsPayload, String> {
+    let notifications = read_cached_skill_catalog_metadata(app)?
+        .map(|metadata| metadata.notifications)
+        .unwrap_or_else(empty_cached_notifications);
+
+    Ok(RemoteNotificationsPayload {
+        cn: notifications.cn,
+        en: notifications.en,
+        source: String::from("cached"),
+    })
+}
+
+fn read_remote_desktop_version_impl(app: &AppHandle) -> Result<RemoteDesktopVersionPayload, String> {
+    let current_version = current_desktop_version(app);
+    let remote_version = read_cached_skill_catalog_metadata(app)?
+        .and_then(|metadata| metadata.desktop_version);
+
+    Ok(RemoteDesktopVersionPayload {
+        update_available: is_remote_desktop_version_newer(remote_version.as_deref(), &current_version),
+        version: remote_version,
+        source: String::from("cached"),
+    })
+}
+
+fn write_cached_skill_catalog(
+    app: &AppHandle,
+    version: &str,
+    url: &str,
+    desktop_version: Option<&str>,
+    notifications: CachedNotifications,
+    catalog_text: &str,
+) -> Result<(), String> {
+    let dir = resolve_remote_skills_dir(app)?;
+    fs::create_dir_all(&dir)
+        .map_err(|error| format!("failed to create remote skills cache directory: {error}"))?;
+
+    let catalog_value: Value = serde_json::from_str(catalog_text)
+        .map_err(|error| format!("failed to parse downloaded skills catalog: {error}"))?;
+    let metadata = CachedSkillCatalogMetadata {
+        version: String::from(version),
+        url: String::from(url),
+        desktop_version: desktop_version.map(String::from),
+        notifications,
+    };
+
+    fs::write(
+        resolve_remote_skills_catalog_path(app)?,
+        serde_json::to_string(&catalog_value)
+            .map_err(|error| format!("failed to serialize cached skills catalog: {error}"))?,
+    )
+    .map_err(|error| format!("failed to write cached skills catalog: {error}"))?;
+
+    fs::write(
+        resolve_remote_skills_metadata_path(app)?,
+        serde_json::to_string(&metadata)
+            .map_err(|error| format!("failed to serialize cached skills metadata: {error}"))?,
+    )
+    .map_err(|error| format!("failed to write cached skills metadata: {error}"))?;
+
+    Ok(())
+}
+
+fn write_cached_skill_catalog_metadata(
+    app: &AppHandle,
+    version: &str,
+    url: &str,
+    desktop_version: Option<&str>,
+    notifications: CachedNotifications,
+) -> Result<(), String> {
+    let dir = resolve_remote_skills_dir(app)?;
+    fs::create_dir_all(&dir)
+        .map_err(|error| format!("failed to create remote skills cache directory: {error}"))?;
+
+    let metadata = CachedSkillCatalogMetadata {
+        version: String::from(version),
+        url: String::from(url),
+        desktop_version: desktop_version.map(String::from),
+        notifications,
+    };
+
+    fs::write(
+        resolve_remote_skills_metadata_path(app)?,
+        serde_json::to_string(&metadata)
+            .map_err(|error| format!("failed to serialize cached skills metadata: {error}"))?,
+    )
+    .map_err(|error| format!("failed to write cached skills metadata: {error}"))?;
+
+    Ok(())
+}
+
+fn ensure_remote_skill_catalog_fresh_impl(
+    app: &AppHandle,
+) -> Result<SkillCatalogRefreshResult, String> {
+    let active_before = read_active_skill_catalog_impl(app)?;
+    let current_desktop_version = current_desktop_version(app);
+    let cached_desktop_version_before = read_cached_skill_catalog_metadata(app)?
+        .and_then(|metadata| metadata.desktop_version);
+    let desktop_update_available_before = is_remote_desktop_version_newer(
+        cached_desktop_version_before.as_deref(),
+        &current_desktop_version,
+    );
+    let client = Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|error| format!("failed to initialize remote skills client: {error}"))?;
+
+    let manifest_response = match client.get(REMOTE_SKILLS_MANIFEST_URL).send() {
+        Ok(response) => response,
+        Err(error) => {
+            let _ = append_launcher_log(
+                app,
+                "WARN",
+                &format!("remote skills manifest request failed: {error}"),
+            );
+            return Ok(SkillCatalogRefreshResult {
+                version: active_before.version,
+                source: active_before.source,
+                updated: false,
+                desktop_version: cached_desktop_version_before,
+                desktop_update_available: desktop_update_available_before,
+            });
+        }
+    };
+
+    if !manifest_response.status().is_success() {
+        let _ = append_launcher_log(
+            app,
+            "WARN",
+            &format!(
+                "remote skills manifest request failed: HTTP {}",
+                manifest_response.status()
+            ),
+        );
+        return Ok(SkillCatalogRefreshResult {
+            version: active_before.version,
+            source: active_before.source,
+            updated: false,
+            desktop_version: cached_desktop_version_before,
+            desktop_update_available: desktop_update_available_before,
+        });
+    }
+
+    let manifest_text = match manifest_response.text() {
+        Ok(text) => text,
+        Err(error) => {
+            let _ = append_launcher_log(
+                app,
+                "WARN",
+                &format!("failed to read remote skills manifest body: {error}"),
+            );
+            return Ok(SkillCatalogRefreshResult {
+                version: active_before.version,
+                source: active_before.source,
+                updated: false,
+                desktop_version: cached_desktop_version_before,
+                desktop_update_available: desktop_update_available_before,
+            });
+        }
+    };
+
+    let manifest: RemoteManifest = match serde_json::from_str(&manifest_text) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            let _ = append_launcher_log(
+                app,
+                "WARN",
+                &format!("failed to parse remote skills manifest: {error}"),
+            );
+            return Ok(SkillCatalogRefreshResult {
+                version: active_before.version,
+                source: active_before.source,
+                updated: false,
+                desktop_version: cached_desktop_version_before,
+                desktop_update_available: desktop_update_available_before,
+            });
+        }
+    };
+
+    let remote_desktop_version = manifest
+        .desktop
+        .map(|desktop| desktop.version.trim().to_string())
+        .filter(|version| !version.is_empty());
+    let desktop_update_available = is_remote_desktop_version_newer(
+        remote_desktop_version.as_deref(),
+        &current_desktop_version,
+    );
+
+    let notifications = manifest
+        .notifications
+        .map(|notifications| CachedNotifications {
+            cn: notifications.cn,
+            en: notifications.en,
+        })
+        .unwrap_or_else(empty_cached_notifications);
+
+    let Some(skills_manifest) = manifest.skills else {
+        let _ = append_launcher_log(app, "WARN", "remote skills manifest missing skills section");
+        return Ok(SkillCatalogRefreshResult {
+            version: active_before.version,
+            source: active_before.source,
+            updated: false,
+            desktop_version: remote_desktop_version,
+            desktop_update_available: desktop_update_available,
+        });
+    };
+
+    let remote_version = skills_manifest.version.trim();
+    let remote_url = skills_manifest.url.trim();
+    if remote_version.is_empty() || remote_url.is_empty() {
+        let _ = append_launcher_log(app, "WARN", "remote skills manifest has empty version or URL");
+        return Ok(SkillCatalogRefreshResult {
+            version: active_before.version,
+            source: active_before.source,
+            updated: false,
+            desktop_version: remote_desktop_version.clone(),
+            desktop_update_available: desktop_update_available,
+        });
+    }
+
+    let needs_update = match is_remote_version_newer(remote_version, &active_before.version) {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = append_launcher_log(
+                app,
+                "WARN",
+                &format!("failed to compare remote skills version: {error}"),
+            );
+            false
+        }
+    };
+
+    if !needs_update {
+        let metadata_version = read_cached_skill_catalog_metadata(app)?
+            .map(|metadata| metadata.version)
+            .unwrap_or_else(|| active_before.version.clone());
+        let metadata_url = read_cached_skill_catalog_metadata(app)?
+            .map(|metadata| metadata.url)
+            .unwrap_or_else(|| String::from(remote_url));
+        let _ = write_cached_skill_catalog_metadata(
+            app,
+            &metadata_version,
+            &metadata_url,
+            remote_desktop_version.as_deref(),
+            notifications,
+        );
+        return Ok(SkillCatalogRefreshResult {
+            version: active_before.version,
+            source: active_before.source,
+            updated: false,
+            desktop_version: remote_desktop_version,
+            desktop_update_available: desktop_update_available,
+        });
+    }
+
+    let skills_response = match client.get(remote_url).send() {
+        Ok(response) => response,
+        Err(error) => {
+            let _ = append_launcher_log(
+                app,
+                "WARN",
+                &format!("remote skills catalog download failed: {error}"),
+            );
+            return Ok(SkillCatalogRefreshResult {
+                version: active_before.version,
+                source: active_before.source,
+                updated: false,
+                desktop_version: remote_desktop_version.clone(),
+                desktop_update_available: desktop_update_available,
+            });
+        }
+    };
+
+    if !skills_response.status().is_success() {
+        let _ = append_launcher_log(
+            app,
+            "WARN",
+            &format!(
+                "remote skills catalog download failed: HTTP {}",
+                skills_response.status()
+            ),
+        );
+        return Ok(SkillCatalogRefreshResult {
+            version: active_before.version,
+            source: active_before.source,
+            updated: false,
+            desktop_version: remote_desktop_version.clone(),
+            desktop_update_available: desktop_update_available,
+        });
+    }
+
+    let catalog_text = match skills_response.text() {
+        Ok(text) => text,
+        Err(error) => {
+            let _ = append_launcher_log(
+                app,
+                "WARN",
+                &format!("failed to read remote skills catalog body: {error}"),
+            );
+            return Ok(SkillCatalogRefreshResult {
+                version: active_before.version,
+                source: active_before.source,
+                updated: false,
+                desktop_version: remote_desktop_version.clone(),
+                desktop_update_available: desktop_update_available,
+            });
+        }
+    };
+
+    if let Err(error) = write_cached_skill_catalog(
+        app,
+        remote_version,
+        remote_url,
+        remote_desktop_version.as_deref(),
+        notifications,
+        &catalog_text,
+    ) {
+        let _ = append_launcher_log(
+            app,
+            "WARN",
+            &format!("failed to persist remote skills catalog: {error}"),
+        );
+        return Ok(SkillCatalogRefreshResult {
+            version: active_before.version,
+            source: active_before.source,
+            updated: false,
+            desktop_version: remote_desktop_version,
+            desktop_update_available: desktop_update_available,
+        });
+    }
+
+    let active_after = read_active_skill_catalog_impl(app)?;
+    let _ = append_launcher_log(
+        app,
+        "INFO",
+        &format!("remote skills catalog updated to version {}", active_after.version),
+    );
+
+    Ok(SkillCatalogRefreshResult {
+        version: active_after.version,
+        source: active_after.source,
+        updated: true,
+        desktop_version: read_cached_skill_catalog_metadata(app)?
+            .and_then(|metadata| metadata.desktop_version),
+        desktop_update_available: read_remote_desktop_version_impl(app)?.update_available,
+    })
 }
 
 fn read_setup_info_impl(app: &AppHandle) -> Result<SetupInfo, String> {
@@ -4663,12 +5573,22 @@ fn node_binary_name() -> &'static str {
     "node"
 }
 
+#[cfg(target_os = "linux")]
+fn node_binary_name() -> &'static str {
+    "node"
+}
+
 #[cfg(target_os = "windows")]
 fn ollama_binary_name() -> &'static str {
     "ollama.exe"
 }
 
 #[cfg(target_os = "macos")]
+fn ollama_binary_name() -> &'static str {
+    "ollama"
+}
+
+#[cfg(target_os = "linux")]
 fn ollama_binary_name() -> &'static str {
     "ollama"
 }
@@ -4693,9 +5613,19 @@ fn ollama_platform_dir_name() -> &'static str {
     "darwin-x64"
 }
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn ollama_platform_dir_name() -> &'static str {
+    "linux-x64"
+}
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+fn ollama_platform_dir_name() -> &'static str {
+    "linux-arm64"
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .manage(GatewayState {
             child: Arc::new(Mutex::new(None)),
             current_port: Arc::new(Mutex::new(CONTROL_UI_PORT)),
@@ -4708,6 +5638,27 @@ pub fn run() {
             pull_pid: Arc::new(Mutex::new(None)),
             stop_requested: Arc::new(Mutex::new(false)),
         })
+        .manage(ExitIntentState {
+            quitting: AtomicBool::new(false),
+        })
+        .on_window_event(|window, event| {
+            if window.label() != "main" {
+                return;
+            }
+
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let quitting = window
+                    .app_handle()
+                    .try_state::<ExitIntentState>()
+                    .map(|state| state.quitting.load(Ordering::SeqCst))
+                    .unwrap_or(false);
+
+                if !quitting {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        })
         .setup(|app| {
             if cfg!(debug_assertions) {
                 app.handle().plugin(
@@ -4717,6 +5668,7 @@ pub fn run() {
                 )?;
             }
             app.handle().plugin(tauri_plugin_dialog::init())?;
+            install_tray(app.handle())?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -4738,6 +5690,10 @@ pub fn run() {
             open_model_add_wizard,
             read_setup_info,
             read_launcher_preferences,
+            ensure_remote_skill_catalog_fresh,
+            read_active_skill_catalog,
+            read_remote_notifications,
+            read_remote_desktop_version,
             save_launcher_preferences,
             reset_launcher_state,
             reset_openclaw_config,
@@ -4760,6 +5716,127 @@ pub fn run() {
             open_whereclaw_terminal,
             get_system_memory_info
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    app.run(|app, event| {
+        if matches!(event, tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit) {
+            if let Err(error) = cleanup_processes_on_exit(app) {
+                let _ = append_launcher_log(app, "WARN", &format!("exit cleanup failed: {error}"));
+            }
+        }
+    });
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        normalize_ollama_model_name_for_lookup,
+        build_whereclaw_terminal_ollama_wrapper_script,
+        build_whereclaw_terminal_shell_rc,
+        build_whereclaw_terminal_windows_script,
+        is_remote_desktop_version_newer,
+        is_remote_version_newer,
+        CachedSkillCatalogMetadata,
+        OLLAMA_HOST,
+    };
+
+    #[test]
+    fn semver_comparison_detects_newer_remote_skills_versions() {
+        assert_eq!(is_remote_version_newer("1.0.2", "1.0.1"), Ok(true));
+        assert_eq!(is_remote_version_newer("1.0.1", "1.0.1"), Ok(false));
+        assert_eq!(is_remote_version_newer("1.0.0", "1.0.1"), Ok(false));
+    }
+
+    #[test]
+    fn cached_skill_metadata_defaults_notifications_for_old_schema() {
+        let metadata: CachedSkillCatalogMetadata = serde_json::from_str(
+            r#"{"version":"1.0.2","url":"https://r2.tolearn.cc/skills.json"}"#,
+        )
+        .expect("old metadata schema should still parse");
+
+        assert_eq!(metadata.desktop_version, None);
+        assert!(metadata.notifications.cn.is_empty());
+        assert!(metadata.notifications.en.is_empty());
+    }
+
+    #[test]
+    fn desktop_update_detection_requires_newer_valid_semver() {
+        assert!(is_remote_desktop_version_newer(Some("1.0.1"), "1.0.0"));
+        assert!(!is_remote_desktop_version_newer(Some("1.0.0"), "1.0.0"));
+        assert!(!is_remote_desktop_version_newer(Some(""), "1.0.0"));
+        assert!(!is_remote_desktop_version_newer(None, "1.0.0"));
+        assert!(!is_remote_desktop_version_newer(Some("latest"), "1.0.0"));
+    }
+
+    #[test]
+    fn treats_bare_and_latest_ollama_model_names_as_equal_for_lookup() {
+        assert_eq!(
+            normalize_ollama_model_name_for_lookup("qwen3.5"),
+            normalize_ollama_model_name_for_lookup("qwen3.5:latest")
+        );
+    }
+
+    #[test]
+    fn preserves_non_latest_tags_for_lookup() {
+        assert_ne!(
+            normalize_ollama_model_name_for_lookup("qwen3.5:0.8b"),
+            normalize_ollama_model_name_for_lookup("qwen3.5:latest")
+        );
+    }
+
+    #[test]
+    fn whereclaw_terminal_shell_rc_exports_ollama_and_advertises_command() {
+        let shell_rc = build_whereclaw_terminal_shell_rc(
+            "/openclaw/home",
+            "/openclaw/home/openclaw.json",
+            "/openclaw/home/tmp",
+            "/openclaw/home/data/npm-cache",
+            "/openclaw/home/data/npm-prefix",
+            "/openclaw/home/data/corepack",
+            "/openclaw/home/tmp/terminal-bin",
+            "/engine/node-runtime/bin",
+            "/openclaw/package",
+            "",
+            "/openclaw/home/data/ollama-models",
+        );
+
+        assert!(shell_rc.contains("export OLLAMA_HOST='127.0.0.1:11434'"));
+        assert!(shell_rc.contains("export OLLAMA_MODELS='/openclaw/home/data/ollama-models'"));
+        assert!(shell_rc.contains("Bundled commands: node, npm, npx, openclaw, ollama"));
+    }
+
+    #[test]
+    fn whereclaw_terminal_ollama_wrapper_targets_bundled_runtime() {
+        let wrapper = build_whereclaw_terminal_ollama_wrapper_script(
+            "/runtime/ollama",
+            "/openclaw/home/data/ollama-models",
+        );
+
+        assert!(wrapper.contains("export OLLAMA_HOST='127.0.0.1:11434'"));
+        assert!(wrapper.contains("export OLLAMA_MODELS='/openclaw/home/data/ollama-models'"));
+        assert!(wrapper.contains("\"/runtime/ollama\" \"$@\""));
+    }
+
+    #[test]
+    fn whereclaw_terminal_windows_script_sets_ollama_env_and_hint() {
+        let script = build_whereclaw_terminal_windows_script(
+            "C:/openclaw/home",
+            "C:/openclaw/home/openclaw.json",
+            "C:/openclaw/home/tmp",
+            "C:/openclaw/home/data/npm-cache",
+            "C:/openclaw/home/data/npm-prefix",
+            "C:/openclaw/home/data/corepack",
+            "C:/openclaw/home/tmp/terminal-bin",
+            "C:/engine/node-runtime",
+            "C:/openclaw/package",
+            "",
+            "C:/openclaw/home/data/ollama-models",
+        );
+
+        assert!(script.contains(&format!("set OLLAMA_HOST={}", OLLAMA_HOST)));
+        assert!(script.contains("set OLLAMA_MODELS=C:/openclaw/home/data/ollama-models"));
+        assert!(script.contains("Bundled commands: node, npm, npx, openclaw, ollama"));
+    }
 }

@@ -8,12 +8,15 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     process::{Child as StdChild, Command, Stdio},
-    sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use portable_pty::{native_pty_system, Child as PtyChild, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{Child as PtyChild, CommandBuilder, MasterPty};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -24,6 +27,11 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{path::BaseDirectory, AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 use url::Url;
 use zip::ZipArchive;
+
+#[cfg(not(target_os = "windows"))]
+use portable_pty::{native_pty_system, PtySize};
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 
 #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
 compile_error!("WhereClaw currently supports only Windows, macOS, and Linux targets.");
@@ -50,9 +58,62 @@ const TRAY_ICON_ID: &str = "main";
 const TRAY_MENU_SHOW_ID: &str = "tray_show";
 const TRAY_MENU_QUIT_ID: &str = "tray_quit";
 
+enum GatewayChild {
+    Pty {
+        child: Box<dyn PtyChild + Send>,
+        _master: Box<dyn MasterPty + Send>,
+    },
+    Std(StdChild),
+}
+
 struct GatewayProcess {
-    child: Box<dyn PtyChild + Send>,
-    _master: Box<dyn MasterPty + Send>,
+    child: GatewayChild,
+}
+
+impl GatewayProcess {
+    fn process_id(&self) -> Option<u32> {
+        match &self.child {
+            GatewayChild::Pty { child, .. } => child.process_id(),
+            GatewayChild::Std(child) => Some(child.id()),
+        }
+    }
+
+    fn is_running(&mut self) -> Result<bool, String> {
+        match &mut self.child {
+            GatewayChild::Pty { child, .. } => child
+                .try_wait()
+                .map(|status| status.is_none())
+                .map_err(|error| format!("failed to inspect gateway process state: {error}")),
+            GatewayChild::Std(child) => child
+                .try_wait()
+                .map(|status| status.is_none())
+                .map_err(|error| format!("failed to inspect gateway process state: {error}")),
+        }
+    }
+
+    fn kill(&mut self) -> Result<(), String> {
+        match &mut self.child {
+            GatewayChild::Pty { child, .. } => child
+                .kill()
+                .map_err(|error| format!("failed to stop gateway process: {error}")),
+            GatewayChild::Std(child) => child
+                .kill()
+                .map_err(|error| format!("failed to stop gateway process: {error}")),
+        }
+    }
+
+    fn wait(&mut self) -> Result<(), String> {
+        match &mut self.child {
+            GatewayChild::Pty { child, .. } => child
+                .wait()
+                .map(|_| ())
+                .map_err(|error| format!("failed to wait for gateway process: {error}")),
+            GatewayChild::Std(child) => child
+                .wait()
+                .map(|_| ())
+                .map_err(|error| format!("failed to wait for gateway process: {error}")),
+        }
+    }
 }
 
 struct GatewayState {
@@ -141,14 +202,13 @@ fn cleanup_processes_on_exit(app: &AppHandle) -> Result<(), String> {
             .lock()
             .map_err(|_| String::from("failed to acquire gateway state lock during exit"))?;
 
-        let running_pid = child_slot.as_mut().map(|process| process.child.process_id());
+        let running_pid = child_slot.as_mut().and_then(|process| process.process_id());
 
         if let Some(mut process) = child_slot.take() {
             process
-                .child
                 .kill()
                 .map_err(|error| format!("failed to stop gateway process during exit: {error}"))?;
-            let _ = process.child.wait();
+            let _ = process.wait();
         }
 
         if let Some(window) = app.get_webview_window(CONTROL_UI_WINDOW_LABEL) {
@@ -271,7 +331,6 @@ struct InstalledSkillEntry {
     enabled: bool,
 }
 
-
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BundledVersionManifest {
@@ -365,7 +424,6 @@ fn collect_system_memory_info() -> Result<SystemMemoryInfo, String> {
     })
 }
 
-
 fn parse_bundled_version_manifest() -> Result<BundledVersionManifest, String> {
     serde_json::from_str(include_str!("../../VERSION.json"))
         .map_err(|error| format!("failed to parse bundled VERSION.json: {error}"))
@@ -387,11 +445,11 @@ fn current_desktop_version(app: &AppHandle) -> String {
     app.package_info().version.to_string()
 }
 
-fn is_remote_desktop_version_newer(
-    remote_version: Option<&str>,
-    current_version: &str,
-) -> bool {
-    let Some(remote_version) = remote_version.map(str::trim).filter(|value| !value.is_empty()) else {
+fn is_remote_desktop_version_newer(remote_version: Option<&str>, current_version: &str) -> bool {
+    let Some(remote_version) = remote_version
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
         return false;
     };
 
@@ -479,14 +537,42 @@ fn collect_gpu_total_bytes() -> Option<u64> {
 
 #[cfg(target_os = "windows")]
 fn collect_gpu_total_bytes() -> Option<u64> {
-    let output = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty AdapterRAM | Sort-Object -Descending | Select-Object -First 1",
-        ])
-        .output()
-        .ok()?;
+    let mut command = Command::new("powershell");
+    command.args([
+        "-NoProfile",
+        "-Command",
+        r#"
+$registryBytes =
+  Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Video\*\0000' -ErrorAction SilentlyContinue |
+  ForEach-Object {
+    foreach ($propertyName in @('HardwareInformation.qwMemorySize', 'HardwareInformation.MemorySize')) {
+      $value = $_.$propertyName
+      if ($null -eq $value) {
+        continue
+      }
+      try {
+        [UInt64]$value
+      }
+      catch {
+      }
+    }
+  } |
+  Where-Object { $_ -gt 0 } |
+  Sort-Object -Descending
+
+if ($registryBytes) {
+  $registryBytes | Select-Object -First 1
+  exit 0
+}
+
+Get-CimInstance Win32_VideoController |
+  Select-Object -ExpandProperty AdapterRAM |
+  Where-Object { $_ -gt 0 } |
+  Sort-Object -Descending |
+  Select-Object -First 1
+"#,
+    ]);
+    let output = hide_windows_console(&mut command).output().ok()?;
 
     if !output.status.success() {
         return None;
@@ -649,19 +735,15 @@ async fn stop_gateway(
     let child = state.child.clone();
     let current_port = state.current_port.clone();
     tauri::async_runtime::spawn_blocking(move || {
+        stop_conflicting_gateway_services();
         let mut child_slot = child
             .lock()
             .map_err(|_| String::from("failed to acquire gateway state lock"))?;
-        let running_pid = child_slot
-            .as_mut()
-            .map(|process| process.child.process_id());
+        let running_pid = child_slot.as_mut().and_then(|process| process.process_id());
 
         if let Some(mut process) = child_slot.take() {
-            process
-                .child
-                .kill()
-                .map_err(|error| format!("failed to stop gateway process: {error}"))?;
-            let _ = process.child.wait();
+            process.kill()?;
+            let _ = process.wait();
         }
 
         if let Some(window) = app.get_webview_window(CONTROL_UI_WINDOW_LABEL) {
@@ -703,15 +785,10 @@ async fn gateway_status(
             .map_err(|_| String::from("failed to acquire gateway port state lock"))?;
 
         if let Some(process) = child_slot.as_mut() {
-            if process
-                .child
-                .try_wait()
-                .map_err(|error| format!("failed to inspect gateway process state: {error}"))?
-                .is_none()
-            {
+            if process.is_running()? {
                 return Ok(GatewayStatus {
                     running: true,
-                    pid: process.child.process_id(),
+                    pid: process.process_id(),
                     url: resolve_control_ui_url(&app)?,
                 });
             }
@@ -855,9 +932,9 @@ async fn check_local_model_exists(
             return Ok(false);
         }
         let models = list_ollama_models_impl(&app, &child)?;
-        Ok(models.iter().any(|existing| {
-            normalize_ollama_model_name_for_lookup(existing) == normalized_model
-        }))
+        Ok(models
+            .iter()
+            .any(|existing| normalize_ollama_model_name_for_lookup(existing) == normalized_model))
     })
     .await
     .map_err(|error| format!("failed to join local-model-exists task: {error}"))?
@@ -998,39 +1075,59 @@ fn stop_local_model_run(state: tauri::State<'_, LocalModelRunState>) -> Result<(
 #[tauri::command]
 fn open_control_ui_window(app: AppHandle) -> Result<(), String> {
     let control_ui_url = resolve_control_ui_url(&app)?;
+    let _ = append_launcher_log(
+        &app,
+        "INFO",
+        &format!("open_control_ui_window requested url={control_ui_url}"),
+    );
 
-    if let Some(window) = app.get_webview_window(CONTROL_UI_WINDOW_LABEL) {
-        window
-            .navigate(control_ui_url.parse().map_err(|error| {
-                format!("failed to parse Control UI url for existing webview window: {error}")
-            })?)
-            .map_err(|error| format!("failed to navigate Control UI window: {error}"))?;
-        window
-            .set_focus()
-            .map_err(|error| format!("failed to focus Control UI window: {error}"))?;
-        return Ok(());
+    #[cfg(target_os = "windows")]
+    {
+        let _ = append_launcher_log(
+            &app,
+            "INFO",
+            "open_control_ui_window using browser fallback on Windows",
+        );
+        return webbrowser::open(&control_ui_url)
+            .map(|_| ())
+            .map_err(|error| format!("failed to open browser: {error}"));
     }
 
-    let launcher_preferences = read_launcher_preferences_impl(&app)?;
-    let initialization_script =
-        control_ui_window_initialization_script(&launcher_preferences.language)?;
+    #[cfg(not(target_os = "windows"))]
+    {
+        if let Some(window) = app.get_webview_window(CONTROL_UI_WINDOW_LABEL) {
+            window
+                .navigate(control_ui_url.parse().map_err(|error| {
+                    format!("failed to parse Control UI url for existing webview window: {error}")
+                })?)
+                .map_err(|error| format!("failed to navigate Control UI window: {error}"))?;
+            window
+                .set_focus()
+                .map_err(|error| format!("failed to focus Control UI window: {error}"))?;
+            return Ok(());
+        }
 
-    WebviewWindowBuilder::new(
-        &app,
-        CONTROL_UI_WINDOW_LABEL,
-        WebviewUrl::External(control_ui_url.parse().map_err(|error| {
-            format!("failed to parse Control UI url for webview window: {error}")
-        })?),
-    )
-    .title("OpenClaw Control UI")
-    .inner_size(1440.0, 920.0)
-    .resizable(true)
-    .focused(true)
-    .initialization_script(&initialization_script)
-    .build()
-    .map_err(|error| format!("failed to create Control UI window: {error}"))?;
+        let launcher_preferences = read_launcher_preferences_impl(&app)?;
+        let initialization_script =
+            control_ui_window_initialization_script(&launcher_preferences.language)?;
 
-    Ok(())
+        WebviewWindowBuilder::new(
+            &app,
+            CONTROL_UI_WINDOW_LABEL,
+            WebviewUrl::External(control_ui_url.parse().map_err(|error| {
+                format!("failed to parse Control UI url for webview window: {error}")
+            })?),
+        )
+        .title("OpenClaw Control UI")
+        .inner_size(1440.0, 920.0)
+        .resizable(true)
+        .focused(true)
+        .initialization_script(&initialization_script)
+        .build()
+        .map_err(|error| format!("failed to create Control UI window: {error}"))?;
+
+        Ok(())
+    }
 }
 
 #[tauri::command]
@@ -1083,7 +1180,10 @@ fn whereclaw_terminal_hint_message() -> &'static str {
     "Bundled commands: node, npm, npx, openclaw, ollama"
 }
 
-fn build_whereclaw_terminal_openclaw_wrapper_script(node_binary: &str, entry_script: &str) -> String {
+fn build_whereclaw_terminal_openclaw_wrapper_script(
+    node_binary: &str,
+    entry_script: &str,
+) -> String {
     format!(
         "#!/bin/zsh
 \"{node}\" \"{entry}\" \"$@\"
@@ -1259,6 +1359,12 @@ fn open_whereclaw_terminal(app: AppHandle) -> Result<(), String> {
     let npm_cache_dir = resolve_npm_cache_dir(&openclaw_home);
     let npm_prefix_dir = resolve_npm_prefix_dir(&openclaw_home);
     let corepack_home_dir = resolve_corepack_home_dir(&openclaw_home);
+    let node_binary_for_node = normalize_windows_path_for_node(&node_binary);
+    let runtime_bin_dir_for_node = normalize_windows_path_for_node(&runtime_bin_dir);
+    let ollama_binary_for_node = normalize_windows_path_for_node(&ollama_binary);
+    let ollama_models_dir_for_node = normalize_windows_path_for_node(&ollama_models_dir);
+    let entry_script_for_node = normalize_windows_path_for_node(&entry_script);
+    let openclaw_package_root_for_node = normalize_windows_path_for_node(&openclaw_package_root);
     let terminal_bin_dir = openclaw_home.join("tmp").join("terminal-bin");
 
     let _ = append_launcher_log(
@@ -1295,8 +1401,9 @@ fn open_whereclaw_terminal(app: AppHandle) -> Result<(), String> {
             &ollama_binary.display().to_string(),
             &ollama_models_dir.display().to_string(),
         );
-        fs::write(&ollama_wrapper_path, ollama_wrapper)
-            .map_err(|error| format!("failed to write WhereClaw terminal ollama wrapper: {error}"))?;
+        fs::write(&ollama_wrapper_path, ollama_wrapper).map_err(|error| {
+            format!("failed to write WhereClaw terminal ollama wrapper: {error}")
+        })?;
         Command::new("chmod")
             .arg("+x")
             .arg(&ollama_wrapper_path)
@@ -1352,19 +1459,20 @@ fn open_whereclaw_terminal(app: AppHandle) -> Result<(), String> {
     {
         let openclaw_wrapper_path = terminal_bin_dir.join("openclaw.cmd");
         let openclaw_wrapper = build_whereclaw_terminal_windows_openclaw_wrapper_script(
-            &node_binary.display().to_string(),
-            &entry_script.display().to_string(),
+            &node_binary_for_node.display().to_string(),
+            &entry_script_for_node.display().to_string(),
         );
         fs::write(&openclaw_wrapper_path, openclaw_wrapper)
             .map_err(|error| format!("failed to write WhereClaw terminal wrapper: {error}"))?;
 
         let ollama_wrapper_path = terminal_bin_dir.join("ollama.cmd");
         let ollama_wrapper = build_whereclaw_terminal_windows_ollama_wrapper_script(
-            &ollama_binary.display().to_string(),
-            &ollama_models_dir.display().to_string(),
+            &ollama_binary_for_node.display().to_string(),
+            &ollama_models_dir_for_node.display().to_string(),
         );
-        fs::write(&ollama_wrapper_path, ollama_wrapper)
-            .map_err(|error| format!("failed to write WhereClaw terminal ollama wrapper: {error}"))?;
+        fs::write(&ollama_wrapper_path, ollama_wrapper).map_err(|error| {
+            format!("failed to write WhereClaw terminal ollama wrapper: {error}")
+        })?;
 
         let script_path = openclaw_home.join("tmp").join("whereclaw-terminal.cmd");
         let npm_registry_commands = npm_registry_cmd_exports(&launcher_preferences.language);
@@ -1376,10 +1484,10 @@ fn open_whereclaw_terminal(app: AppHandle) -> Result<(), String> {
             &npm_prefix_dir.display().to_string(),
             &corepack_home_dir.display().to_string(),
             &terminal_bin_dir.display().to_string(),
-            &runtime_bin_dir.display().to_string(),
-            &openclaw_package_root.display().to_string(),
+            &runtime_bin_dir_for_node.display().to_string(),
+            &openclaw_package_root_for_node.display().to_string(),
             &npm_registry_commands,
-            &ollama_models_dir.display().to_string(),
+            &ollama_models_dir_for_node.display().to_string(),
         );
         fs::write(&script_path, script)
             .map_err(|error| format!("failed to write WhereClaw terminal script: {error}"))?;
@@ -1468,6 +1576,10 @@ fn open_official_terminal_command(
     let runtime_bin_dir = resolve_runtime_bin_dir(&engine_dir)?;
     let entry_script = resolve_openclaw_entry(&engine_dir)?;
     let openclaw_package_root = resolve_openclaw_package_root(&entry_script)?;
+    let node_binary_for_node = normalize_windows_path_for_node(&node_binary);
+    let runtime_bin_dir_for_node = normalize_windows_path_for_node(&runtime_bin_dir);
+    let entry_script_for_node = normalize_windows_path_for_node(&entry_script);
+    let openclaw_package_root_for_node = normalize_windows_path_for_node(&openclaw_package_root);
     let openclaw_home = initialize_openclaw_home(&app, &engine_dir)?;
     let tmp_dir = initialize_openclaw_tmp_dir(&openclaw_home)?;
     let npm_cache_dir = resolve_npm_cache_dir(&openclaw_home);
@@ -1522,7 +1634,11 @@ fn open_official_terminal_command(
     #[cfg(target_os = "windows")]
     {
         let npm_registry_commands = npm_registry_cmd_exports(&launcher_preferences.language);
-        let openclaw_cmd_argv = openclaw_args.join(" ");
+        let openclaw_cmd_argv = openclaw_args
+            .iter()
+            .map(|value| cmd_quote_arg(value))
+            .collect::<Vec<_>>()
+            .join(" ");
         let script_path = openclaw_home
             .join("tmp")
             .join(format!("whereclaw-{script_stem}.cmd"));
@@ -1534,13 +1650,13 @@ fn open_official_terminal_command(
             npm_cache = cmd_escape(&npm_cache_dir.display().to_string()),
             npm_prefix = cmd_escape(&npm_prefix_dir.display().to_string()),
             corepack_home = cmd_escape(&corepack_home_dir.display().to_string()),
-            runtime_bin = cmd_escape(&runtime_bin_dir.display().to_string()),
-            package_root = cmd_escape(&openclaw_package_root.display().to_string()),
+            runtime_bin = cmd_escape(&runtime_bin_dir_for_node.display().to_string()),
+            package_root = cmd_escape(&openclaw_package_root_for_node.display().to_string()),
             npm_registry = npm_registry_commands,
             intro = intro_message,
             finish = finish_message,
-            node = node_binary.display(),
-            entry = entry_script.display(),
+            node = node_binary_for_node.display(),
+            entry = entry_script_for_node.display(),
             argv = openclaw_cmd_argv,
         );
         fs::write(&script_path, script)
@@ -1581,8 +1697,7 @@ fn open_path_in_default_app(path: &Path) -> Result<(), String> {
 
     #[cfg(target_os = "windows")]
     {
-        Command::new("cmd")
-            .args(["/C", "start", ""])
+        Command::new("explorer")
             .arg(path)
             .status()
             .map_err(|error| format!("failed to open path in Explorer: {error}"))
@@ -1690,7 +1805,7 @@ const __WHERECLAW_LOCALE__ = {locale_json};
     const button = document.createElement('button');
     button.id = OPEN_BUTTON_ID;
     button.type = 'button';
-    button.textContent = '↗';
+    button.textContent = '�?;
     button.setAttribute('aria-label', labels.open);
     button.setAttribute('title', labels.open);
     button.addEventListener('click', () => {{
@@ -1820,8 +1935,8 @@ async fn reset_launcher_state(
             .map_err(|_| String::from("failed to acquire gateway state lock"))?;
 
         if let Some(mut process) = child_slot.take() {
-            let _ = process.child.kill();
-            let _ = process.child.wait();
+            let _ = process.kill();
+            let _ = process.wait();
         }
 
         if let Some(window) = app.get_webview_window(CONTROL_UI_WINDOW_LABEL) {
@@ -1899,8 +2014,8 @@ async fn reset_openclaw_config(
             .map_err(|_| String::from("failed to acquire gateway state lock"))?;
 
         if let Some(mut process) = child_slot.take() {
-            let _ = process.child.kill();
-            let _ = process.child.wait();
+            let _ = process.kill();
+            let _ = process.wait();
         }
 
         if let Some(window) = app.get_webview_window(CONTROL_UI_WINDOW_LABEL) {
@@ -1955,6 +2070,7 @@ async fn apply_initial_setup_config(
 ) -> Result<SetupInfo, String> {
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
+        stop_conflicting_gateway_services();
         let preferences = read_launcher_preferences_impl(&app)?;
         if !preferences.has_saved_preferences {
             return Err(String::from(
@@ -1984,7 +2100,7 @@ async fn apply_initial_setup_config(
         }
 
         write_openclaw_config(&openclaw_home, &config)?;
-        sanitize_openclaw_config(&openclaw_home)?;
+        sanitize_openclaw_config(&openclaw_home, Some(&engine_dir))?;
         save_launcher_preferences_impl(
             &app,
             &preferences.language,
@@ -2117,18 +2233,13 @@ fn start_gateway_impl(
         .map_err(|_| String::from("failed to acquire gateway state lock"))?;
 
     if let Some(process) = child_slot.as_mut() {
-        if process
-            .child
-            .try_wait()
-            .map_err(|error| format!("failed to inspect gateway process state: {error}"))?
-            .is_none()
-        {
+        if process.is_running()? {
             let port = *current_port
                 .lock()
                 .map_err(|_| String::from("failed to acquire gateway port state lock"))?;
             return Ok(GatewayStatus {
                 running: true,
-                pid: process.child.process_id(),
+                pid: process.process_id(),
                 url: control_ui_url_for_port(port),
             });
         }
@@ -2141,6 +2252,10 @@ fn start_gateway_impl(
     let runtime_bin_dir = resolve_runtime_bin_dir(&engine_dir)?;
     let entry_script = resolve_openclaw_entry(&engine_dir)?;
     let openclaw_package_root = resolve_openclaw_package_root(&entry_script)?;
+    let node_binary_for_node = normalize_windows_path_for_node(&node_binary);
+    let runtime_bin_dir_for_node = normalize_windows_path_for_node(&runtime_bin_dir);
+    let entry_script_for_node = normalize_windows_path_for_node(&entry_script);
+    let openclaw_package_root_for_node = normalize_windows_path_for_node(&openclaw_package_root);
     stop_conflicting_gateway_services();
     let openclaw_home = initialize_openclaw_home(app, &engine_dir)?;
     let config = read_openclaw_config(&openclaw_home)?;
@@ -2164,64 +2279,110 @@ fn start_gateway_impl(
         .write(true)
         .open(&console_log)
         .map_err(|error| format!("failed to create gateway console log: {error}"))?;
-    let pty_system = native_pty_system();
-    let pty_pair = pty_system
-        .openpty(PtySize {
-            rows: 40,
-            cols: 160,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .map_err(|error| format!("failed to create gateway PTY: {error}"))?;
-    let mut reader = pty_pair
-        .master
-        .try_clone_reader()
-        .map_err(|error| format!("failed to clone gateway PTY reader: {error}"))?;
-    thread::spawn(move || {
-        let mut log_file = console_handle;
-        let mut buffer = [0_u8; 4096];
-        loop {
-            match reader.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(size) => {
-                    if log_file.write_all(&buffer[..size]).is_err() {
-                        break;
+    #[cfg(target_os = "windows")]
+    let pid = {
+        let stdout_log = console_handle
+            .try_clone()
+            .map_err(|error| format!("failed to clone gateway console log handle: {error}"))?;
+        let stderr_log = console_handle;
+        let mut command = Command::new(&node_binary_for_node);
+        command
+            .current_dir(&openclaw_package_root_for_node)
+            .arg(&entry_script_for_node)
+            .arg("gateway")
+            .arg("--port")
+            .arg(configured_port.to_string())
+            .env("OPENCLAW_HOME", &openclaw_home)
+            .env("OPENCLAW_STATE_DIR", &openclaw_home)
+            .env("OPENCLAW_CONFIG_PATH", openclaw_home.join("openclaw.json"))
+            .env("TMPDIR", &tmp_dir)
+            .env("NPM_CONFIG_CACHE", &npm_cache_dir)
+            .env("npm_config_cache", &npm_cache_dir)
+            .env("NPM_CONFIG_PREFIX", &npm_prefix_dir)
+            .env("npm_config_prefix", &npm_prefix_dir)
+            .env("COREPACK_HOME", &corepack_home_dir)
+            .env("NO_COLOR", "1")
+            .env("TERM", "dumb")
+            .env("CI", "1")
+            .stdout(Stdio::from(stdout_log))
+            .stderr(Stdio::from(stderr_log));
+        apply_registry_env(&mut command, &launcher_preferences.language);
+        prepend_path_env(&mut command, &runtime_bin_dir_for_node)?;
+
+        let child = hide_windows_console(&mut command)
+            .spawn()
+            .map_err(|error| format!("failed to start bundled OpenClaw gateway: {error}"))?;
+        let pid = child.id();
+        *child_slot = Some(GatewayProcess {
+            child: GatewayChild::Std(child),
+        });
+        Some(pid)
+    };
+
+    #[cfg(not(target_os = "windows"))]
+    let pid = {
+        let pty_system = native_pty_system();
+        let pty_pair = pty_system
+            .openpty(PtySize {
+                rows: 40,
+                cols: 160,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|error| format!("failed to create gateway PTY: {error}"))?;
+        let mut reader = pty_pair
+            .master
+            .try_clone_reader()
+            .map_err(|error| format!("failed to clone gateway PTY reader: {error}"))?;
+        thread::spawn(move || {
+            let mut log_file = console_handle;
+            let mut buffer = [0_u8; 4096];
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(size) => {
+                        if log_file.write_all(&buffer[..size]).is_err() {
+                            break;
+                        }
+                        let _ = log_file.flush();
                     }
-                    let _ = log_file.flush();
+                    Err(_) => break,
                 }
-                Err(_) => break,
             }
-        }
-    });
+        });
 
-    let mut command = CommandBuilder::new(node_binary);
-    command.cwd(&openclaw_package_root);
-    command.arg(entry_script);
-    command.arg("gateway");
-    command.arg("--port");
-    command.arg(configured_port.to_string());
-    command.env("OPENCLAW_HOME", &openclaw_home);
-    command.env("OPENCLAW_STATE_DIR", &openclaw_home);
-    command.env("OPENCLAW_CONFIG_PATH", openclaw_home.join("openclaw.json"));
-    command.env("TMPDIR", &tmp_dir);
-    command.env("NPM_CONFIG_CACHE", &npm_cache_dir);
-    command.env("npm_config_cache", &npm_cache_dir);
-    command.env("NPM_CONFIG_PREFIX", &npm_prefix_dir);
-    command.env("npm_config_prefix", &npm_prefix_dir);
-    command.env("COREPACK_HOME", &corepack_home_dir);
-    apply_registry_env_to_pty_command(&mut command, &launcher_preferences.language);
-    prepend_path_env_to_pty_command(&mut command, &runtime_bin_dir)?;
+        let mut command = CommandBuilder::new(node_binary_for_node);
+        command.cwd(&openclaw_package_root_for_node);
+        command.arg(entry_script_for_node);
+        command.arg("gateway");
+        command.arg("--port");
+        command.arg(configured_port.to_string());
+        command.env("OPENCLAW_HOME", &openclaw_home);
+        command.env("OPENCLAW_STATE_DIR", &openclaw_home);
+        command.env("OPENCLAW_CONFIG_PATH", openclaw_home.join("openclaw.json"));
+        command.env("TMPDIR", &tmp_dir);
+        command.env("NPM_CONFIG_CACHE", &npm_cache_dir);
+        command.env("npm_config_cache", &npm_cache_dir);
+        command.env("NPM_CONFIG_PREFIX", &npm_prefix_dir);
+        command.env("npm_config_prefix", &npm_prefix_dir);
+        command.env("COREPACK_HOME", &corepack_home_dir);
+        apply_registry_env_to_pty_command(&mut command, &launcher_preferences.language);
+        prepend_path_env_to_pty_command(&mut command, &runtime_bin_dir_for_node)?;
 
-    let child = pty_pair
-        .slave
-        .spawn_command(command)
-        .map_err(|error| format!("failed to start bundled OpenClaw gateway: {error}"))?;
+        let child = pty_pair
+            .slave
+            .spawn_command(command)
+            .map_err(|error| format!("failed to start bundled OpenClaw gateway: {error}"))?;
 
-    let pid = child.process_id();
-    *child_slot = Some(GatewayProcess {
-        child,
-        _master: pty_pair.master,
-    });
+        let pid = child.process_id();
+        *child_slot = Some(GatewayProcess {
+            child: GatewayChild::Pty {
+                child,
+                _master: pty_pair.master,
+            },
+        });
+        pid
+    };
     *current_port
         .lock()
         .map_err(|_| String::from("failed to acquire gateway port state lock"))? = configured_port;
@@ -2233,8 +2394,8 @@ fn start_gateway_impl(
             &format!("start_gateway failed port={configured_port} error={error}"),
         );
         if let Some(mut running_process) = child_slot.take() {
-            let _ = running_process.child.kill();
-            let _ = running_process.child.wait();
+            let _ = running_process.kill();
+            let _ = running_process.wait();
         }
         return Err(error);
     }
@@ -2276,8 +2437,83 @@ fn stop_conflicting_gateway_services() {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+fn stop_conflicting_gateway_services() {
+    let _ = stop_windows_gateway_scheduled_task();
+    let _ = stop_windows_processes_listening_on_port(CONTROL_UI_PORT);
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 fn stop_conflicting_gateway_services() {}
+
+#[cfg(target_os = "windows")]
+fn stop_windows_gateway_scheduled_task() -> Result<(), String> {
+    let mut command = Command::new("schtasks");
+    command.args(["/End", "/TN", "Openclaw Gateway"]);
+    let status = hide_windows_console(&mut command)
+        .status()
+        .map_err(|error| format!("failed to stop scheduled gateway task: {error}"))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        // The task may not exist or may already be stopped. That's fine.
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn stop_windows_processes_listening_on_port(port: u16) -> Result<(), String> {
+    let mut command = Command::new("netstat");
+    command.args(["-ano", "-p", "tcp"]);
+    let output = hide_windows_console(&mut command)
+        .output()
+        .map_err(|error| format!("failed to inspect TCP listeners: {error}"))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "failed to inspect TCP listeners with status {}",
+            output.status
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let suffix = format!(":{port}");
+    let mut pids = Vec::new();
+
+    for line in stdout.lines() {
+        let normalized = line.trim();
+        if normalized.is_empty() || !normalized.contains("LISTENING") {
+            continue;
+        }
+
+        let parts = normalized.split_whitespace().collect::<Vec<_>>();
+        if parts.len() < 5 {
+            continue;
+        }
+
+        let local_address = parts[1];
+        if !local_address.ends_with(&suffix) {
+            continue;
+        }
+
+        let Ok(pid) = parts[4].parse::<u32>() else {
+            continue;
+        };
+
+        if pid != std::process::id() && !pids.contains(&pid) {
+            pids.push(pid);
+        }
+    }
+
+    for pid in pids {
+        let mut taskkill = Command::new("taskkill");
+        taskkill.args(["/PID", &pid.to_string(), "/T", "/F"]);
+        let _ = hide_windows_console(&mut taskkill).status();
+    }
+
+    Ok(())
+}
 
 fn wait_for_gateway_ready(
     child_slot: &mut Option<GatewayProcess>,
@@ -2288,11 +2524,7 @@ fn wait_for_gateway_ready(
 
     for _ in 0..HEALTH_CHECK_ATTEMPTS {
         if let Some(process) = child_slot.as_mut() {
-            if let Some(status) = process
-                .child
-                .try_wait()
-                .map_err(|error| format!("failed to inspect gateway process state: {error}"))?
-            {
+            if !process.is_running()? {
                 let console_excerpt = fs::read_to_string(console_log).ok().map(|content| {
                     let mut lines = content
                         .lines()
@@ -2304,7 +2536,7 @@ fn wait_for_gateway_ready(
                     lines.join("\n")
                 });
 
-                let mut message = format!("OpenClaw gateway exited early with status {status}.");
+                let mut message = String::from("OpenClaw gateway exited early.");
                 if let Some(console_excerpt) =
                     console_excerpt.filter(|value| !value.trim().is_empty())
                 {
@@ -2414,13 +2646,15 @@ fn start_ollama_impl(
         .try_clone()
         .map_err(|error| format!("failed to clone ollama log file handle: {error}"))?;
 
-    let child = Command::new(&ollama_binary)
+    let mut command = Command::new(&ollama_binary);
+    command
         .current_dir(&ollama_runtime_dir)
         .arg("serve")
         .env("OLLAMA_HOST", OLLAMA_HOST)
         .env("OLLAMA_MODELS", &models_dir)
         .stdout(Stdio::from(stdout_log))
-        .stderr(Stdio::from(stderr_log))
+        .stderr(Stdio::from(stderr_log));
+    let child = hide_windows_console(&mut command)
         .spawn()
         .map_err(|error| format!("failed to start bundled ollama: {error}"))?;
 
@@ -2483,16 +2717,17 @@ fn stop_all_ollama_processes() -> Result<(), String> {
 
     #[cfg(target_os = "windows")]
     {
-        let status = Command::new("taskkill")
-            .args(["/IM", "ollama.exe", "/F", "/T"])
+        let mut taskkill = Command::new("taskkill");
+        taskkill.args(["/IM", "ollama.exe", "/F", "/T"]);
+        let status = hide_windows_console(&mut taskkill)
             .status()
             .map_err(|error| format!("failed to execute taskkill for ollama.exe: {error}"))?;
 
         // taskkill may return non-zero when process is not found; tolerate that case.
         if !status.success() {
-            let _ = Command::new("tasklist")
-                .args(["/FI", "IMAGENAME eq ollama.exe"])
-                .status();
+            let mut tasklist = Command::new("tasklist");
+            tasklist.args(["/FI", "IMAGENAME eq ollama.exe"]);
+            let _ = hide_windows_console(&mut tasklist).status();
         }
 
         kill_ollama_port_processes_windows()?;
@@ -2528,8 +2763,9 @@ fn kill_ollama_port_processes_macos() -> Result<(), String> {
 
 #[cfg(target_os = "windows")]
 fn kill_ollama_port_processes_windows() -> Result<(), String> {
-    let output = Command::new("netstat")
-        .args(["-ano"])
+    let mut netstat = Command::new("netstat");
+    netstat.args(["-ano"]);
+    let output = hide_windows_console(&mut netstat)
         .output()
         .map_err(|error| format!("failed to execute netstat for ollama port: {error}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -2539,9 +2775,9 @@ fn kill_ollama_port_processes_windows() -> Result<(), String> {
         }
         let parts = line.split_whitespace().collect::<Vec<_>>();
         if let Some(pid) = parts.last() {
-            let _ = Command::new("taskkill")
-                .args(["/PID", pid, "/F", "/T"])
-                .status();
+            let mut taskkill = Command::new("taskkill");
+            taskkill.args(["/PID", pid, "/F", "/T"]);
+            let _ = hide_windows_console(&mut taskkill).status();
         }
     }
     Ok(())
@@ -2569,12 +2805,14 @@ fn pull_ollama_model_impl(
         .to_path_buf();
     let models_dir = resolve_ollama_models_dir(app)?;
 
-    let output = Command::new(&ollama_binary)
+    let mut command = Command::new(&ollama_binary);
+    command
         .current_dir(&ollama_runtime_dir)
         .arg("pull")
         .arg(normalized_model)
         .env("OLLAMA_HOST", OLLAMA_HOST)
-        .env("OLLAMA_MODELS", &models_dir)
+        .env("OLLAMA_MODELS", &models_dir);
+    let output = hide_windows_console(&mut command)
         .output()
         .map_err(|error| format!("failed to pull ollama model: {error}"))?;
 
@@ -2624,11 +2862,13 @@ fn list_ollama_models_impl(
         .to_path_buf();
     let models_dir = resolve_ollama_models_dir(app)?;
 
-    let output = Command::new(&ollama_binary)
+    let mut command = Command::new(&ollama_binary);
+    command
         .current_dir(&ollama_runtime_dir)
         .arg("list")
         .env("OLLAMA_HOST", OLLAMA_HOST)
-        .env("OLLAMA_MODELS", &models_dir)
+        .env("OLLAMA_MODELS", &models_dir);
+    let output = hide_windows_console(&mut command)
         .output()
         .map_err(|error| format!("failed to list ollama models: {error}"))?;
 
@@ -2775,7 +3015,8 @@ fn run_local_model_workflow_impl(
         .to_path_buf();
     let models_dir = resolve_ollama_models_dir(app)?;
 
-    let output = Command::new(&ollama_binary)
+    let mut command = Command::new(&ollama_binary);
+    command
         .current_dir(&ollama_runtime_dir)
         .arg("run")
         .arg("--keepalive")
@@ -2783,7 +3024,8 @@ fn run_local_model_workflow_impl(
         .arg(normalized_model)
         .arg("hello")
         .env("OLLAMA_HOST", OLLAMA_HOST)
-        .env("OLLAMA_MODELS", &models_dir)
+        .env("OLLAMA_MODELS", &models_dir);
+    let output = hide_windows_console(&mut command)
         .output()
         .map_err(|error| format!("failed to run ollama model: {error}"))?;
 
@@ -2821,14 +3063,16 @@ fn run_ollama_pull_with_progress(
         .to_path_buf();
     let models_dir = resolve_ollama_models_dir(app)?;
 
-    let mut child = Command::new(&ollama_binary)
+    let mut command = Command::new(&ollama_binary);
+    command
         .current_dir(&ollama_runtime_dir)
         .arg("pull")
         .arg(model)
         .env("OLLAMA_HOST", OLLAMA_HOST)
         .env("OLLAMA_MODELS", &models_dir)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = hide_windows_console(&mut command)
         .spawn()
         .map_err(|error| format!("failed to pull ollama model: {error}"))?;
 
@@ -3227,8 +3471,9 @@ fn kill_process_by_pid(pid: u32) -> Result<(), String> {
 
 #[cfg(windows)]
 fn kill_process_by_pid(pid: u32) -> Result<(), String> {
-    let status = Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/T", "/F"])
+    let mut command = Command::new("taskkill");
+    command.args(["/PID", &pid.to_string(), "/T", "/F"]);
+    let status = hide_windows_console(&mut command)
         .status()
         .map_err(|error| format!("failed to stop local model download pid {pid}: {error}"))?;
 
@@ -3305,6 +3550,23 @@ fn resolve_engine_dir(app: &AppHandle) -> Result<PathBuf, String> {
     }
 
     Ok(engine_dir)
+}
+
+#[cfg(target_os = "windows")]
+fn normalize_windows_path_for_node(path: &Path) -> PathBuf {
+    let text = path.as_os_str().to_string_lossy();
+    if let Some(stripped) = text.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{stripped}"));
+    }
+    if let Some(stripped) = text.strip_prefix(r"\\?\") {
+        return PathBuf::from(stripped);
+    }
+    path.to_path_buf()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn normalize_windows_path_for_node(path: &Path) -> PathBuf {
+    path.to_path_buf()
 }
 
 fn resolve_node_binary(engine_dir: &Path) -> Result<PathBuf, String> {
@@ -3614,7 +3876,9 @@ fn resolve_remote_skills_metadata_path(app: &AppHandle) -> Result<PathBuf, Strin
     Ok(resolve_remote_skills_dir(app)?.join(REMOTE_SKILLS_METADATA_FILE_NAME))
 }
 
-fn read_cached_skill_catalog_metadata(app: &AppHandle) -> Result<Option<CachedSkillCatalogMetadata>, String> {
+fn read_cached_skill_catalog_metadata(
+    app: &AppHandle,
+) -> Result<Option<CachedSkillCatalogMetadata>, String> {
     let path = resolve_remote_skills_metadata_path(app)?;
     if !path.exists() {
         return Ok(None);
@@ -3659,13 +3923,18 @@ fn read_remote_notifications_impl(app: &AppHandle) -> Result<RemoteNotifications
     })
 }
 
-fn read_remote_desktop_version_impl(app: &AppHandle) -> Result<RemoteDesktopVersionPayload, String> {
+fn read_remote_desktop_version_impl(
+    app: &AppHandle,
+) -> Result<RemoteDesktopVersionPayload, String> {
     let current_version = current_desktop_version(app);
-    let remote_version = read_cached_skill_catalog_metadata(app)?
-        .and_then(|metadata| metadata.desktop_version);
+    let remote_version =
+        read_cached_skill_catalog_metadata(app)?.and_then(|metadata| metadata.desktop_version);
 
     Ok(RemoteDesktopVersionPayload {
-        update_available: is_remote_desktop_version_newer(remote_version.as_deref(), &current_version),
+        update_available: is_remote_desktop_version_newer(
+            remote_version.as_deref(),
+            &current_version,
+        ),
         version: remote_version,
         source: String::from("cached"),
     })
@@ -3742,8 +4011,8 @@ fn ensure_remote_skill_catalog_fresh_impl(
 ) -> Result<SkillCatalogRefreshResult, String> {
     let active_before = read_active_skill_catalog_impl(app)?;
     let current_desktop_version = current_desktop_version(app);
-    let cached_desktop_version_before = read_cached_skill_catalog_metadata(app)?
-        .and_then(|metadata| metadata.desktop_version);
+    let cached_desktop_version_before =
+        read_cached_skill_catalog_metadata(app)?.and_then(|metadata| metadata.desktop_version);
     let desktop_update_available_before = is_remote_desktop_version_newer(
         cached_desktop_version_before.as_deref(),
         &current_desktop_version,
@@ -3856,7 +4125,11 @@ fn ensure_remote_skill_catalog_fresh_impl(
     let remote_version = skills_manifest.version.trim();
     let remote_url = skills_manifest.url.trim();
     if remote_version.is_empty() || remote_url.is_empty() {
-        let _ = append_launcher_log(app, "WARN", "remote skills manifest has empty version or URL");
+        let _ = append_launcher_log(
+            app,
+            "WARN",
+            "remote skills manifest has empty version or URL",
+        );
         return Ok(SkillCatalogRefreshResult {
             version: active_before.version,
             source: active_before.source,
@@ -3981,7 +4254,10 @@ fn ensure_remote_skill_catalog_fresh_impl(
     let _ = append_launcher_log(
         app,
         "INFO",
-        &format!("remote skills catalog updated to version {}", active_after.version),
+        &format!(
+            "remote skills catalog updated to version {}",
+            active_after.version
+        ),
     );
 
     Ok(SkillCatalogRefreshResult {
@@ -4133,6 +4409,27 @@ fn list_channel_accounts_impl(app: &AppHandle) -> Result<Vec<ChannelAccount>, St
                 account_id: String::from(account_id),
             });
         }
+    }
+
+    let openclaw_home = resolve_openclaw_home_dir(app)?;
+    let config = read_openclaw_config(&openclaw_home)?;
+    let qq_enabled = config
+        .get("channels")
+        .and_then(Value::as_object)
+        .and_then(|channels| channels.get("qqbot"))
+        .and_then(Value::as_object)
+        .and_then(|qqbot| qqbot.get("enabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if qq_enabled
+        && !accounts
+            .iter()
+            .any(|entry| entry.channel == "qqbot" && entry.account_id == "default")
+    {
+        accounts.push(ChannelAccount {
+            channel: String::from("qqbot"),
+            account_id: String::from("default"),
+        });
     }
 
     accounts.sort_by(|left, right| {
@@ -4753,7 +5050,7 @@ fn save_local_model_selection_impl(app: &AppHandle, model: &str) -> Result<(), S
 
     apply_initial_ollama_model_config(root, normalized_model);
     write_openclaw_config(&openclaw_home, &config)?;
-    sanitize_openclaw_config(&openclaw_home)?;
+    sanitize_openclaw_config(&openclaw_home, Some(&engine_dir))?;
 
     let model_ref = format!("ollama/{normalized_model}");
     set_openclaw_primary_model_impl(app, &model_ref)?;
@@ -5006,9 +5303,10 @@ fn ensure_qq_plugin_ready(app: &AppHandle, engine_dir: &Path) -> Result<Option<S
         .join("extensions")
         .join("qqbot");
     let bundled_entry = bundled_plugin_dir.join("index.ts");
-    let bundled_node_modules = bundled_plugin_dir.join("node_modules");
+    let bundled_entry_alt = bundled_plugin_dir.join("dist").join("index.js");
 
-    if bundled_entry.exists() && bundled_node_modules.exists() {
+    // Prefer the bundled plugin and avoid runtime installs.
+    if bundled_entry.exists() || bundled_entry_alt.exists() {
         return Ok(Some(bundled_plugin_dir.display().to_string()));
     }
 
@@ -5017,13 +5315,6 @@ fn ensure_qq_plugin_ready(app: &AppHandle, engine_dir: &Path) -> Result<Option<S
         .join("qqbot");
     if installed_plugin_dir.exists() {
         return Ok(None);
-    }
-
-    if let Err(error) = run_openclaw_command(app, &["plugins", "install", "@sliverp/qqbot"]) {
-        if error.contains("插件已存在") || error.contains("already exists") {
-            return Ok(None);
-        }
-        return Err(error);
     }
 
     Ok(None)
@@ -5153,7 +5444,7 @@ fn initialize_openclaw_home(app: &AppHandle, engine_dir: &Path) -> Result<PathBu
             .map_err(|error| format!("failed to create OpenClaw config: {error}"))?;
     }
 
-    sanitize_openclaw_config(&openclaw_home)?;
+    sanitize_openclaw_config(&openclaw_home, Some(engine_dir))?;
 
     Ok(openclaw_home)
 }
@@ -5262,11 +5553,15 @@ fn run_openclaw_command(app: &AppHandle, openclaw_args: &[&str]) -> Result<Strin
     let npm_cache_dir = resolve_npm_cache_dir(&openclaw_home);
     let npm_prefix_dir = resolve_npm_prefix_dir(&openclaw_home);
     let corepack_home_dir = resolve_corepack_home_dir(&openclaw_home);
+    let node_binary_for_node = normalize_windows_path_for_node(&node_binary);
+    let runtime_bin_dir_for_node = normalize_windows_path_for_node(&runtime_bin_dir);
+    let entry_script_for_node = normalize_windows_path_for_node(&entry_script);
+    let openclaw_package_root_for_node = normalize_windows_path_for_node(&openclaw_package_root);
 
-    let mut command = Command::new(&node_binary);
+    let mut command = Command::new(&node_binary_for_node);
     command
-        .current_dir(&openclaw_package_root)
-        .arg(&entry_script)
+        .current_dir(&openclaw_package_root_for_node)
+        .arg(&entry_script_for_node)
         .args(openclaw_args)
         .env("OPENCLAW_HOME", &openclaw_home)
         .env("OPENCLAW_STATE_DIR", &openclaw_home)
@@ -5278,9 +5573,9 @@ fn run_openclaw_command(app: &AppHandle, openclaw_args: &[&str]) -> Result<Strin
         .env("npm_config_prefix", &npm_prefix_dir)
         .env("COREPACK_HOME", &corepack_home_dir);
     apply_registry_env(&mut command, &launcher_preferences.language);
-    prepend_path_env(&mut command, &runtime_bin_dir)?;
+    prepend_path_env(&mut command, &runtime_bin_dir_for_node)?;
 
-    let output = command
+    let output = hide_windows_console(&mut command)
         .output()
         .map_err(|error| format!("failed to run official OpenClaw command: {error}"))?;
 
@@ -5364,6 +5659,7 @@ fn read_openclaw_config(openclaw_home: &Path) -> Result<Value, String> {
 
     let config_text = fs::read_to_string(&config_path)
         .map_err(|error| format!("failed to read OpenClaw config: {error}"))?;
+    let config_text = config_text.trim_start_matches('\u{feff}');
 
     if config_text.trim().is_empty() {
         return Ok(Value::Object(Map::new()));
@@ -5381,7 +5677,7 @@ fn write_openclaw_config(openclaw_home: &Path, config: &Value) -> Result<(), Str
         .map_err(|error| format!("failed to update OpenClaw config: {error}"))
 }
 
-fn sanitize_openclaw_config(openclaw_home: &Path) -> Result<(), String> {
+fn sanitize_openclaw_config(openclaw_home: &Path, engine_dir: Option<&Path>) -> Result<(), String> {
     let mut config = read_openclaw_config(openclaw_home)?;
     let root = ensure_object(&mut config, "OpenClaw config root")?;
     let mut changed = false;
@@ -5416,6 +5712,10 @@ fn sanitize_openclaw_config(openclaw_home: &Path) -> Result<(), String> {
             );
             changed = true;
         }
+    }
+
+    if repair_plugin_load_paths(root, openclaw_home, engine_dir)? {
+        changed = true;
     }
 
     if changed {
@@ -5460,6 +5760,125 @@ fn generate_local_gateway_token(openclaw_home: &Path) -> String {
         now.as_nanos().hash(&mut hasher);
     }
     format!("whereclaw-{:016x}", hasher.finish())
+}
+
+fn resolve_qq_plugin_path_for_config(
+    openclaw_home: &Path,
+    engine_dir: Option<&Path>,
+) -> Option<String> {
+    if let Some(engine_dir) = engine_dir {
+        let bundled_plugin_dir = engine_dir
+            .join("openclaw")
+            .join("node_modules")
+            .join("openclaw-cn")
+            .join("extensions")
+            .join("qqbot");
+        if bundled_plugin_dir.join("index.ts").exists()
+            || bundled_plugin_dir.join("dist").join("index.js").exists()
+        {
+            return Some(
+                normalize_windows_path_for_node(&bundled_plugin_dir)
+                    .display()
+                    .to_string(),
+            );
+        }
+    }
+
+    let installed_plugin_dir = openclaw_home.join("extensions").join("qqbot");
+    if installed_plugin_dir.exists() {
+        return Some(
+            normalize_windows_path_for_node(&installed_plugin_dir)
+                .display()
+                .to_string(),
+        );
+    }
+
+    None
+}
+fn repair_plugin_load_paths(
+    root: &mut Map<String, Value>,
+    openclaw_home: &Path,
+    engine_dir: Option<&Path>,
+) -> Result<bool, String> {
+    let qq_enabled = root
+        .get("channels")
+        .and_then(Value::as_object)
+        .and_then(|channels| channels.get("qqbot"))
+        .and_then(Value::as_object)
+        .and_then(|qqbot| qqbot.get("enabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || root
+            .get("plugins")
+            .and_then(Value::as_object)
+            .and_then(|plugins| plugins.get("entries"))
+            .and_then(Value::as_object)
+            .and_then(|entries| entries.get("qqbot"))
+            .and_then(Value::as_object)
+            .and_then(|qqbot| qqbot.get("enabled"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+    let desired_qq_path = if qq_enabled {
+        resolve_qq_plugin_path_for_config(openclaw_home, engine_dir)
+    } else {
+        None
+    };
+
+    let Some(plugins_obj) = root.get_mut("plugins").and_then(Value::as_object_mut) else {
+        return Ok(false);
+    };
+    let Some(load_obj) = plugins_obj.get_mut("load").and_then(Value::as_object_mut) else {
+        return Ok(false);
+    };
+    let Some(paths) = load_obj.get_mut("paths").and_then(Value::as_array_mut) else {
+        return Ok(false);
+    };
+
+    let bundled_marker = "/whereclaw-engine/openclaw/node_modules/openclaw-cn/extensions/qqbot";
+    let installed_marker = "/openclaw-home/extensions/qqbot";
+    let mut changed = false;
+
+    paths.retain(|entry| {
+        let Some(path) = entry.as_str() else {
+            return true;
+        };
+
+        if !Path::new(path).exists() {
+            changed = true;
+            return false;
+        }
+
+        let is_qq_path = path.replace('\\', "/").contains(bundled_marker)
+            || path.replace('\\', "/").contains(installed_marker)
+            || path.replace('\\', "/").ends_with("/extensions/qqbot");
+
+        if is_qq_path {
+            if let Some(desired_path) = desired_qq_path.as_deref() {
+                if path != desired_path {
+                    changed = true;
+                    return false;
+                }
+            } else {
+                changed = true;
+                return false;
+            }
+        }
+
+        true
+    });
+
+    if let Some(desired_path) = desired_qq_path {
+        let exists = paths
+            .iter()
+            .any(|entry| entry.as_str().is_some_and(|value| value == desired_path));
+        if !exists {
+            paths.push(Value::String(desired_path));
+            changed = true;
+        }
+    }
+
+    Ok(changed)
 }
 
 fn ensure_object<'a>(
@@ -5553,7 +5972,6 @@ fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
 fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
@@ -5561,6 +5979,22 @@ fn shell_single_quote(value: &str) -> String {
 #[cfg(target_os = "windows")]
 fn cmd_escape(value: &str) -> String {
     value.replace('^', "^^")
+}
+
+#[cfg(target_os = "windows")]
+fn cmd_quote_arg(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+#[cfg(target_os = "windows")]
+fn hide_windows_console(command: &mut Command) -> &mut Command {
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn hide_windows_console(command: &mut Command) -> &mut Command {
+    command
 }
 
 #[cfg(target_os = "windows")]
@@ -5720,7 +6154,10 @@ pub fn run() {
         .expect("error while building tauri application");
 
     app.run(|app, event| {
-        if matches!(event, tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit) {
+        if matches!(
+            event,
+            tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+        ) {
             if let Err(error) = cleanup_processes_on_exit(app) {
                 let _ = append_launcher_log(app, "WARN", &format!("exit cleanup failed: {error}"));
             }
@@ -5728,18 +6165,13 @@ pub fn run() {
     });
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_ollama_model_name_for_lookup,
-        build_whereclaw_terminal_ollama_wrapper_script,
-        build_whereclaw_terminal_shell_rc,
-        build_whereclaw_terminal_windows_script,
-        is_remote_desktop_version_newer,
-        is_remote_version_newer,
-        CachedSkillCatalogMetadata,
-        OLLAMA_HOST,
+        build_whereclaw_terminal_ollama_wrapper_script, build_whereclaw_terminal_shell_rc,
+        build_whereclaw_terminal_windows_script, is_remote_desktop_version_newer,
+        is_remote_version_newer, normalize_ollama_model_name_for_lookup,
+        CachedSkillCatalogMetadata, OLLAMA_HOST,
     };
 
     #[test]
@@ -5840,3 +6272,4 @@ mod tests {
         assert!(script.contains("Bundled commands: node, npm, npx, openclaw, ollama"));
     }
 }
+

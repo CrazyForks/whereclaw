@@ -56,7 +56,6 @@
   },
   "homepage": "https://github.com/gaofc/whereclaw#readme",
   "directories": {
-    "doc": "docs",
-    "test": "tests"
+    "doc": "docs"
   }
 }

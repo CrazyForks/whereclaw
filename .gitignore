@@ -33,4 +33,4 @@ whereclaw-engine/openclaw/.npmrc
 .worktrees/
 .codex/
 src-tauri/target/
-.release-artifacts/
+/release-artifacts/

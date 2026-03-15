@@ -2534,7 +2534,7 @@ export default function App() {
       const nextGatewayStatus = await invoke<GatewayStatus>("start_gateway");
       setGatewayStatus(nextGatewayStatus);
       clearStatusMessage({ action: "handleStartGateway", result: "started" });
-      await handleOpenControlUi();
+      void handleOpenControlUi();
     } catch (error) {
       showStatusError(error, copy.startFailed, {
         action: "handleStartGateway",

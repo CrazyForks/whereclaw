@@ -40,7 +40,7 @@ const CONTROL_UI_PORT: u16 = 18_789;
 const OLLAMA_PORT: u16 = 11_434;
 const OLLAMA_HOST: &str = "127.0.0.1:11434";
 const CONTROL_UI_WINDOW_LABEL: &str = "control-ui";
-const HEALTH_CHECK_ATTEMPTS: usize = 40;
+const HEALTH_CHECK_ATTEMPTS: usize = 120;
 const HEALTH_CHECK_DELAY_MS: u64 = 250;
 const ZH_NPM_REGISTRY: &str = "https://registry.npmmirror.com";
 const LAUNCHER_LOG_FILE_NAME: &str = "whereclaw.log";
@@ -5295,29 +5295,115 @@ fn apply_initial_ollama_model_config(root: &mut Map<String, Value>, model: &str)
     }
 }
 
-fn ensure_qq_plugin_ready(app: &AppHandle, engine_dir: &Path) -> Result<Option<String>, String> {
-    let bundled_plugin_dir = engine_dir
+fn resolve_bundled_qq_plugin_dir(engine_dir: &Path) -> PathBuf {
+    engine_dir
         .join("openclaw")
         .join("node_modules")
         .join("openclaw-cn")
         .join("extensions")
-        .join("qqbot");
-    let bundled_entry = bundled_plugin_dir.join("index.ts");
-    let bundled_entry_alt = bundled_plugin_dir.join("dist").join("index.js");
+        .join("qqbot")
+}
 
-    // Prefer the bundled plugin and avoid runtime installs.
-    if bundled_entry.exists() || bundled_entry_alt.exists() {
-        return Ok(Some(bundled_plugin_dir.display().to_string()));
+fn resolve_installed_qq_plugin_dir(openclaw_home: &Path) -> PathBuf {
+    openclaw_home.join("extensions").join("qqbot")
+}
+
+fn qq_plugin_path_for_node(path: &Path) -> String {
+    normalize_windows_path_for_node(path).display().to_string()
+}
+
+fn qq_plugin_dir_has_runtime_entry(plugin_dir: &Path) -> bool {
+    if plugin_dir.join("dist").join("index.js").exists() {
+        return true;
     }
 
-    let installed_plugin_dir = resolve_openclaw_home_dir(app)?
-        .join("extensions")
-        .join("qqbot");
-    if installed_plugin_dir.exists() {
+    let package_json = plugin_dir.join("package.json");
+    let Ok(package_text) = fs::read_to_string(package_json) else {
+        return false;
+    };
+    let Ok(package_value) = serde_json::from_str::<Value>(&package_text) else {
+        return false;
+    };
+
+    package_value
+        .get("openclaw")
+        .and_then(Value::as_object)
+        .and_then(|openclaw| openclaw.get("extensions"))
+        .and_then(Value::as_array)
+        .is_some_and(|extensions| {
+            extensions.iter().filter_map(Value::as_str).any(|entry| {
+                let trimmed = entry.trim();
+                !trimmed.is_empty() && plugin_dir.join(trimmed).exists()
+            })
+        })
+}
+
+fn ensure_generated_qq_plugin_wrapper(
+    openclaw_home: &Path,
+    engine_dir: &Path,
+) -> Result<Option<PathBuf>, String> {
+    let bundled_plugin_dir = resolve_bundled_qq_plugin_dir(engine_dir);
+    let bundled_manifest = bundled_plugin_dir.join("openclaw.plugin.json");
+    let bundled_channel_entry = bundled_plugin_dir.join("src").join("channel.ts");
+    if !bundled_manifest.exists() || !bundled_channel_entry.exists() {
         return Ok(None);
     }
 
+    let wrapper_dir = resolve_installed_qq_plugin_dir(openclaw_home);
+    fs::create_dir_all(&wrapper_dir)
+        .map_err(|error| format!("failed to create qqbot wrapper directory: {error}"))?;
+
+    fs::copy(&bundled_manifest, wrapper_dir.join("openclaw.plugin.json"))
+        .map_err(|error| format!("failed to copy qqbot manifest into wrapper dir: {error}"))?;
+
+    fs::write(
+        wrapper_dir.join("package.json"),
+        "{\n  \"name\": \"qqbot\",\n  \"type\": \"module\",\n  \"openclaw\": {\n    \"extensions\": [\"./index.ts\"]\n  }\n}\n",
+    )
+    .map_err(|error| format!("failed to write qqbot wrapper package.json: {error}"))?;
+
+    let import_path = serde_json::to_string(&qq_plugin_path_for_node(&bundled_channel_entry))
+        .map_err(|error| format!("failed to encode qqbot wrapper import path: {error}"))?;
+    let wrapper_source = format!(
+        "import {{ qqbotPlugin }} from {import_path};\n\nconst plugin = {{\n  id: \"qqbot\",\n  register(api) {{\n    api.registerChannel({{ plugin: qqbotPlugin }});\n  }},\n}};\n\nexport default plugin;\n"
+    );
+    fs::write(wrapper_dir.join("index.ts"), wrapper_source)
+        .map_err(|error| format!("failed to write qqbot wrapper entry: {error}"))?;
+
+    Ok(Some(wrapper_dir))
+}
+
+fn ensure_qq_plugin_runtime_path(
+    openclaw_home: &Path,
+    engine_dir: Option<&Path>,
+) -> Result<Option<String>, String> {
+    if let Some(engine_dir) = engine_dir {
+        let bundled_plugin_dir = resolve_bundled_qq_plugin_dir(engine_dir);
+        if qq_plugin_dir_has_runtime_entry(&bundled_plugin_dir) {
+            return Ok(Some(qq_plugin_path_for_node(&bundled_plugin_dir)));
+        }
+
+        let installed_plugin_dir = resolve_installed_qq_plugin_dir(openclaw_home);
+        if qq_plugin_dir_has_runtime_entry(&installed_plugin_dir) {
+            return Ok(Some(qq_plugin_path_for_node(&installed_plugin_dir)));
+        }
+
+        if let Some(wrapper_dir) = ensure_generated_qq_plugin_wrapper(openclaw_home, engine_dir)? {
+            return Ok(Some(qq_plugin_path_for_node(&wrapper_dir)));
+        }
+    }
+
+    let installed_plugin_dir = resolve_installed_qq_plugin_dir(openclaw_home);
+    if qq_plugin_dir_has_runtime_entry(&installed_plugin_dir) {
+        return Ok(Some(qq_plugin_path_for_node(&installed_plugin_dir)));
+    }
+
     Ok(None)
+}
+
+fn ensure_qq_plugin_ready(app: &AppHandle, engine_dir: &Path) -> Result<Option<String>, String> {
+    let openclaw_home = resolve_openclaw_home_dir(app)?;
+    ensure_qq_plugin_runtime_path(&openclaw_home, Some(engine_dir))
 }
 
 fn apply_initial_qq_channel_config(
@@ -5765,36 +5851,10 @@ fn generate_local_gateway_token(openclaw_home: &Path) -> String {
 fn resolve_qq_plugin_path_for_config(
     openclaw_home: &Path,
     engine_dir: Option<&Path>,
-) -> Option<String> {
-    if let Some(engine_dir) = engine_dir {
-        let bundled_plugin_dir = engine_dir
-            .join("openclaw")
-            .join("node_modules")
-            .join("openclaw-cn")
-            .join("extensions")
-            .join("qqbot");
-        if bundled_plugin_dir.join("index.ts").exists()
-            || bundled_plugin_dir.join("dist").join("index.js").exists()
-        {
-            return Some(
-                normalize_windows_path_for_node(&bundled_plugin_dir)
-                    .display()
-                    .to_string(),
-            );
-        }
-    }
-
-    let installed_plugin_dir = openclaw_home.join("extensions").join("qqbot");
-    if installed_plugin_dir.exists() {
-        return Some(
-            normalize_windows_path_for_node(&installed_plugin_dir)
-                .display()
-                .to_string(),
-        );
-    }
-
-    None
+) -> Result<Option<String>, String> {
+    ensure_qq_plugin_runtime_path(openclaw_home, engine_dir)
 }
+
 fn repair_plugin_load_paths(
     root: &mut Map<String, Value>,
     openclaw_home: &Path,
@@ -5820,7 +5880,7 @@ fn repair_plugin_load_paths(
             .unwrap_or(false);
 
     let desired_qq_path = if qq_enabled {
-        resolve_qq_plugin_path_for_config(openclaw_home, engine_dir)
+        resolve_qq_plugin_path_for_config(openclaw_home, engine_dir)?
     } else {
         None
     };
@@ -6167,11 +6227,16 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, time::{SystemTime, UNIX_EPOCH}};
+
+    use serde_json::Value;
+
     use super::{
         build_whereclaw_terminal_ollama_wrapper_script, build_whereclaw_terminal_shell_rc,
         build_whereclaw_terminal_windows_script, is_remote_desktop_version_newer,
         is_remote_version_newer, normalize_ollama_model_name_for_lookup,
-        CachedSkillCatalogMetadata, OLLAMA_HOST,
+        repair_plugin_load_paths, resolve_qq_plugin_path_for_config, ensure_object, CachedSkillCatalogMetadata,
+        HEALTH_CHECK_ATTEMPTS, HEALTH_CHECK_DELAY_MS, OLLAMA_HOST,
     };
 
     #[test]
@@ -6271,5 +6336,159 @@ mod tests {
         assert!(script.contains("set OLLAMA_MODELS=C:/openclaw/home/data/ollama-models"));
         assert!(script.contains("Bundled commands: node, npm, npx, openclaw, ollama"));
     }
-}
 
+    #[test]
+    fn gateway_startup_wait_timeout_is_30_seconds() {
+        assert_eq!(HEALTH_CHECK_ATTEMPTS as u64 * HEALTH_CHECK_DELAY_MS, 30_000);
+    }
+
+    #[test]
+    fn resolve_qq_plugin_path_prefers_runtime_ready_bundled_plugin_over_installed_wrapper() {
+        let unique = format!(
+            "whereclaw-qqbot-bundled-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time should be after unix epoch")
+                .as_nanos()
+        );
+        let temp_root = std::env::temp_dir().join(unique);
+        let openclaw_home = temp_root.join("openclaw-home");
+        let engine_dir = temp_root.join("whereclaw-engine");
+        let bundled_plugin_dir = engine_dir
+            .join("openclaw")
+            .join("node_modules")
+            .join("openclaw-cn")
+            .join("extensions")
+            .join("qqbot");
+        let installed_plugin_dir = openclaw_home.join("extensions").join("qqbot");
+
+        fs::create_dir_all(&bundled_plugin_dir).expect("should create bundled qqbot dir");
+        fs::write(
+            bundled_plugin_dir.join("package.json"),
+            r#"{
+  "name": "@sliverp/qqbot",
+  "openclaw": {
+    "extensions": ["./index.ts"]
+  }
+}
+"#,
+        )
+        .expect("should write bundled qqbot package.json");
+        fs::write(bundled_plugin_dir.join("index.ts"), "export default {};
+")
+            .expect("should write bundled qqbot runtime entry");
+
+        fs::create_dir_all(&installed_plugin_dir).expect("should create installed qqbot dir");
+        fs::write(
+            installed_plugin_dir.join("package.json"),
+            r#"{
+  "name": "qqbot",
+  "openclaw": {
+    "extensions": ["./index.ts"]
+  }
+}
+"#,
+        )
+        .expect("should write installed wrapper package.json");
+        fs::write(installed_plugin_dir.join("index.ts"), "export default {};
+")
+            .expect("should write installed wrapper entry");
+
+        let resolved = resolve_qq_plugin_path_for_config(&openclaw_home, Some(&engine_dir))
+            .expect("should resolve qqbot runtime path")
+            .expect("should prefer bundled qqbot runtime path");
+
+        assert_eq!(resolved, bundled_plugin_dir.display().to_string());
+
+        let _ = fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn repair_plugin_load_paths_generates_runtime_ready_qq_wrapper_for_source_only_bundle() {
+        let unique = format!(
+            "whereclaw-qqbot-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time should be after unix epoch")
+                .as_nanos()
+        );
+        let temp_root = std::env::temp_dir().join(unique);
+        let openclaw_home = temp_root.join("openclaw-home");
+        let engine_dir = temp_root.join("whereclaw-engine");
+        let bundled_plugin_dir = engine_dir
+            .join("openclaw")
+            .join("node_modules")
+            .join("openclaw-cn")
+            .join("extensions")
+            .join("qqbot");
+
+        fs::create_dir_all(bundled_plugin_dir.join("src"))
+            .expect("should create bundled qqbot source directory");
+        fs::write(
+            bundled_plugin_dir.join("openclaw.plugin.json"),
+            r#"{"id":"qqbot","channels":["qqbot"],"configSchema":{"type":"object","additionalProperties":false,"properties":{}}}"#,
+        )
+        .expect("should write bundled qqbot manifest");
+        fs::write(
+            bundled_plugin_dir.join("src").join("channel.ts"),
+            "export const qqbotPlugin = { id: 'qqbot' };\n",
+        )
+        .expect("should write bundled qqbot channel entry");
+
+        let bundled_path = bundled_plugin_dir.display().to_string();
+        let mut root = serde_json::json!({
+            "channels": {
+                "qqbot": {
+                    "enabled": true,
+                    "appId": "demo-app",
+                    "clientSecret": "demo-secret"
+                }
+            },
+            "plugins": {
+                "entries": {
+                    "qqbot": {
+                        "enabled": true
+                    }
+                },
+                "load": {
+                    "paths": [bundled_path]
+                }
+            }
+        });
+
+        let changed = repair_plugin_load_paths(
+            ensure_object(&mut root, "test config root").expect("config root should be object"),
+            &openclaw_home,
+            Some(&engine_dir),
+        )
+        .expect("should repair qqbot plugin load path");
+
+        let generated_path = openclaw_home.join("extensions").join("qqbot");
+        let paths = root
+            .get("plugins")
+            .and_then(Value::as_object)
+            .and_then(|plugins| plugins.get("load"))
+            .and_then(Value::as_object)
+            .and_then(|load| load.get("paths"))
+            .and_then(Value::as_array)
+            .expect("repaired config should have plugin load paths");
+        let normalized_paths = paths
+            .iter()
+            .filter_map(Value::as_str)
+            .map(String::from)
+            .collect::<Vec<_>>();
+
+        assert!(changed);
+        assert!(
+            normalized_paths.contains(&generated_path.display().to_string()),
+            "repaired paths should point at generated qqbot wrapper dir"
+        );
+        assert!(generated_path.join("index.ts").exists());
+        assert!(generated_path.join("package.json").exists());
+        assert!(generated_path.join("openclaw.plugin.json").exists());
+
+        let _ = fs::remove_dir_all(&temp_root);
+    }
+}

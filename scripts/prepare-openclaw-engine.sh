@@ -16,6 +16,7 @@ trap cleanup EXIT
 OPENCLAW_PACKAGE="${OPENCLAW_PACKAGE:-openclaw-cn@latest}"
 NODE_VERSION="${NODE_VERSION:-22.20.0}"
 OLLAMA_VERSION="${OLLAMA_VERSION:-0.17.7}"
+QQBOT_PACKAGE="${QQBOT_PACKAGE:-@sliverp/qqbot@latest}"
 OPTIONAL_CHANNEL_PLUGIN_DIRS=(
   "bluebubbles"
   "feishu"
@@ -26,7 +27,6 @@ OPTIONAL_CHANNEL_PLUGIN_DIRS=(
   "msteams"
   "nextcloud-talk"
   "nostr"
-  "qqbot"
   "synology-chat"
   "tlon"
   "twitch"
@@ -264,6 +264,69 @@ install_openclaw() {
   cp -R "$package_root/dist/control-ui" "$runtime_control_ui_dir"
 }
 
+remove_unsafe_plugin_local_links() {
+  local plugin_root="$1"
+  local plugin_node_modules="$plugin_root/node_modules"
+
+  if [[ ! -d "$plugin_node_modules" ]]; then
+    return
+  fi
+
+  for unsafe_name in whereclaw openclaw; do
+    if [[ -e "$plugin_node_modules/$unsafe_name" ]]; then
+      echo "Removing unsafe local linked dependency from $(basename "$plugin_root"): $unsafe_name" >&2
+      rm -rf "$plugin_node_modules/$unsafe_name"
+    fi
+  done
+}
+
+build_bundled_qqbot_plugin() {
+  local runtime_bin="$NODE_RUNTIME_DIR/bin"
+  local npm_binary="$runtime_bin/npm"
+  local plugin_root="$ENGINE_DIR/openclaw/node_modules/openclaw-cn/extensions/qqbot"
+  local pack_dir="$TEMP_DIR/qqbot-pack"
+  local extract_dir="$TEMP_DIR/qqbot-extract"
+  local tarball
+  local package_root
+
+  echo "Bundling real qqbot plugin from $QQBOT_PACKAGE..."
+
+  rm -rf "$pack_dir" "$extract_dir" "$plugin_root"
+  mkdir -p "$pack_dir" "$extract_dir"
+
+  (
+    cd "$pack_dir"
+    PATH="$runtime_bin:$PATH" "$npm_binary" pack "$QQBOT_PACKAGE" >/dev/null
+  )
+
+  tarball="$(find "$pack_dir" -maxdepth 1 -type f -name '*.tgz' | head -n 1)"
+  if [[ -z "$tarball" ]]; then
+    echo "Failed to download $QQBOT_PACKAGE tarball during bundling." >&2
+    exit 1
+  fi
+
+  tar -xzf "$tarball" -C "$extract_dir"
+
+  package_root="$extract_dir/package"
+  if [[ ! -f "$package_root/package.json" ]]; then
+    echo "Extracted qqbot plugin package.json was not found." >&2
+    exit 1
+  fi
+
+  mkdir -p "$plugin_root"
+  cp -R "$package_root"/. "$plugin_root"
+
+  echo "Installing bundled qqbot plugin dependencies..."
+  PATH="$runtime_bin:$PATH" "$npm_binary" install --prefix "$plugin_root" --no-audit --no-fund --omit=dev --legacy-peer-deps
+
+  remove_unsafe_plugin_local_links "$plugin_root"
+
+  if [[ ! -f "$plugin_root/index.ts" ]]; then
+    echo "Bundled qqbot plugin entry was not found at $plugin_root/index.ts." >&2
+    exit 1
+  fi
+}
+
 install_optional_channel_plugin_dependencies() {
   local runtime_bin="$NODE_RUNTIME_DIR/bin"
   local npm_binary="$runtime_bin/npm"
@@ -292,6 +355,7 @@ main() {
   download_and_extract_node
   download_and_extract_ollama
   install_openclaw
+  build_bundled_qqbot_plugin
   install_optional_channel_plugin_dependencies
 
   printf "%s\n" "$OLLAMA_VERSION" >"$ENGINE_DIR/ollama/VERSION"

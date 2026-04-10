@@ -13,10 +13,7 @@ cleanup() {
 
 trap cleanup EXIT
 
-OPENCLAW_PACKAGE="${OPENCLAW_PACKAGE:-openclaw-cn@latest}"
 NODE_VERSION="${NODE_VERSION:-22.20.0}"
-OLLAMA_VERSION="${OLLAMA_VERSION:-0.17.7}"
-QQBOT_PACKAGE="${QQBOT_PACKAGE:-@sliverp/qqbot@latest}"
 OPTIONAL_CHANNEL_PLUGIN_DIRS=(
   "bluebubbles"
   "feishu"
@@ -136,11 +133,52 @@ detect_node_archive() {
   esac
 }
 
+download_file() {
+  local url="$1"
+  local output_path="$2"
+  local label="$3"
+  local partial_path="${output_path}.part"
+  local attempt
+
+  rm -f "$partial_path"
+
+  for attempt in 1 2 3; do
+    echo "Downloading $label (attempt $attempt/3)..."
+    if curl -fL --retry 3 --retry-delay 2 --connect-timeout 20 -o "$partial_path" "$url"; then
+      mv "$partial_path" "$output_path"
+      return 0
+    fi
+
+    rm -f "$partial_path"
+    if [[ "$attempt" != "3" ]]; then
+      sleep 2
+    fi
+  done
+
+  echo "Failed to download $label after 3 attempts." >&2
+  return 1
+}
+
+has_existing_node_runtime() {
+  local version_file="$NODE_RUNTIME_DIR/VERSION"
+
+  if [[ ! -x "$NODE_RUNTIME_DIR/bin/node" || ! -f "$NODE_RUNTIME_DIR/bin/npm" || ! -f "$version_file" ]]; then
+    return 1
+  fi
+
+  [[ "$(tr -d '\r\n' <"$version_file")" == "$NODE_VERSION" ]]
+}
+
 download_and_extract_node() {
   local archive_name
   local archive_path
   local extract_dir
   local runtime_source
+
+  if has_existing_node_runtime; then
+    echo "Reusing bundled Node.js runtime $NODE_VERSION from $NODE_RUNTIME_DIR"
+    return
+  fi
 
   archive_name="$(detect_node_archive)"
   archive_path="$TEMP_DIR/$archive_name"
@@ -148,8 +186,10 @@ download_and_extract_node() {
 
   mkdir -p "$extract_dir"
 
-  echo "Downloading Node.js $NODE_VERSION ($archive_name)..."
-  curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/${archive_name}" -o "$archive_path"
+  download_file \
+    "https://nodejs.org/dist/v${NODE_VERSION}/${archive_name}" \
+    "$archive_path" \
+    "Node.js $NODE_VERSION ($archive_name)"
 
   case "$archive_name" in
     *.tar.gz) tar -xzf "$archive_path" -C "$extract_dir" ;;
@@ -179,6 +219,8 @@ download_and_extract_node() {
     echo "Bundled Node runtime is missing bin/npm." >&2
     exit 1
   fi
+
+  printf "%s\n" "$NODE_VERSION" >"$NODE_RUNTIME_DIR/VERSION"
 }
 
 download_and_extract_ollama() {
@@ -188,6 +230,8 @@ download_and_extract_ollama() {
   local extract_dir
   local runtime_dir
   local ollama_binary
+  local ollama_version_output
+  local resolved_ollama_version
 
   platform_dir="$(detect_ollama_platform_dir)"
   archive_name="$(detect_ollama_archive_for "$(uname -s)" "$(uname -m)")"
@@ -197,8 +241,10 @@ download_and_extract_ollama() {
 
   mkdir -p "$extract_dir"
 
-  echo "Downloading Ollama $OLLAMA_VERSION ($archive_name)..."
-  curl -fsSL "https://github.com/ollama/ollama/releases/download/v${OLLAMA_VERSION}/${archive_name}" -o "$archive_path"
+  download_file \
+    "https://github.com/ollama/ollama/releases/latest/download/${archive_name}" \
+    "$archive_path" \
+    "latest Ollama ($archive_name)"
   case "$archive_name" in
     *.tgz|*.tar.gz) tar -xzf "$archive_path" -C "$extract_dir" ;;
     *.tar.zst) tar --zstd -xf "$archive_path" -C "$extract_dir" ;;
@@ -226,20 +272,30 @@ download_and_extract_ollama() {
     cp "$ollama_binary" "$runtime_dir/ollama"
     chmod +x "$runtime_dir/ollama"
   fi
+
+  ollama_version_output="$("$runtime_dir/ollama" --version)"
+  resolved_ollama_version="$(printf "%s\n" "$ollama_version_output" | sed -nE 's/.*([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' | head -n 1)"
+  if [[ -z "$resolved_ollama_version" ]]; then
+    echo "Unable to determine downloaded Ollama version from: $ollama_version_output" >&2
+    exit 1
+  fi
+
+  printf "%s\n" "$resolved_ollama_version" >"$ENGINE_DIR/ollama/VERSION"
 }
 
 install_openclaw() {
   local install_root="$TEMP_DIR/openclaw-install"
   local runtime_bin="$NODE_RUNTIME_DIR/bin"
   local npm_binary="$runtime_bin/npm"
-  local package_root="$ENGINE_DIR/openclaw/node_modules/openclaw-cn"
+  local npm_cache="$TEMP_DIR/npm-cache"
+  local package_root="$ENGINE_DIR/openclaw/node_modules/openclaw"
   local runtime_control_ui_dir="$runtime_bin/control-ui"
 
-  mkdir -p "$install_root"
+  mkdir -p "$install_root" "$npm_cache"
 
-  echo "Installing OpenClaw package $OPENCLAW_PACKAGE..."
-  PATH="$runtime_bin:$PATH" "$npm_binary" init -y --prefix "$install_root" >/dev/null
-  PATH="$runtime_bin:$PATH" "$npm_binary" install --prefix "$install_root" --no-audit --no-fund --omit=dev "$OPENCLAW_PACKAGE"
+  echo "Installing OpenClaw package openclaw@latest..."
+  PATH="$runtime_bin:$PATH" NPM_CONFIG_CACHE="$npm_cache" npm_config_cache="$npm_cache" "$npm_binary" init -y --prefix "$install_root" >/dev/null
+  PATH="$runtime_bin:$PATH" NPM_CONFIG_CACHE="$npm_cache" npm_config_cache="$npm_cache" "$npm_binary" install --prefix "$install_root" --no-audit --no-fund --omit=dev openclaw@latest
 
   rm -rf "$ENGINE_DIR/openclaw/node_modules"
   mkdir -p "$ENGINE_DIR/openclaw"
@@ -250,7 +306,7 @@ install_openclaw() {
     cp "$install_root/package-lock.json" "$ENGINE_DIR/openclaw/package-lock.json"
   fi
 
-  if [[ ! -f "$package_root/dist/entry.js" ]]; then
+  if [[ ! -f "$package_root/openclaw.mjs" ]]; then
     echo "Installed OpenClaw entry script was not found." >&2
     exit 1
   fi
@@ -280,57 +336,11 @@ remove_unsafe_plugin_local_links() {
   done
 }
 
-build_bundled_qqbot_plugin() {
-  local runtime_bin="$NODE_RUNTIME_DIR/bin"
-  local npm_binary="$runtime_bin/npm"
-  local plugin_root="$ENGINE_DIR/openclaw/node_modules/openclaw-cn/extensions/qqbot"
-  local pack_dir="$TEMP_DIR/qqbot-pack"
-  local extract_dir="$TEMP_DIR/qqbot-extract"
-  local tarball
-  local package_root
-
-  echo "Bundling real qqbot plugin from $QQBOT_PACKAGE..."
-
-  rm -rf "$pack_dir" "$extract_dir" "$plugin_root"
-  mkdir -p "$pack_dir" "$extract_dir"
-
-  (
-    cd "$pack_dir"
-    PATH="$runtime_bin:$PATH" "$npm_binary" pack "$QQBOT_PACKAGE" >/dev/null
-  )
-
-  tarball="$(find "$pack_dir" -maxdepth 1 -type f -name '*.tgz' | head -n 1)"
-  if [[ -z "$tarball" ]]; then
-    echo "Failed to download $QQBOT_PACKAGE tarball during bundling." >&2
-    exit 1
-  fi
-
-  tar -xzf "$tarball" -C "$extract_dir"
-
-  package_root="$extract_dir/package"
-  if [[ ! -f "$package_root/package.json" ]]; then
-    echo "Extracted qqbot plugin package.json was not found." >&2
-    exit 1
-  fi
-
-  mkdir -p "$plugin_root"
-  cp -R "$package_root"/. "$plugin_root"
-
-  echo "Installing bundled qqbot plugin dependencies..."
-  PATH="$runtime_bin:$PATH" "$npm_binary" install --prefix "$plugin_root" --no-audit --no-fund --omit=dev --legacy-peer-deps
-
-  remove_unsafe_plugin_local_links "$plugin_root"
-
-  if [[ ! -f "$plugin_root/index.ts" ]]; then
-    echo "Bundled qqbot plugin entry was not found at $plugin_root/index.ts." >&2
-    exit 1
-  fi
-}
-
 install_optional_channel_plugin_dependencies() {
   local runtime_bin="$NODE_RUNTIME_DIR/bin"
   local npm_binary="$runtime_bin/npm"
-  local extensions_root="$ENGINE_DIR/openclaw/node_modules/openclaw-cn/extensions"
+  local npm_cache="$TEMP_DIR/npm-cache"
+  local extensions_root="$ENGINE_DIR/openclaw/node_modules/openclaw/dist/extensions"
 
   if [[ ! -d "$extensions_root" ]]; then
     return
@@ -339,7 +349,7 @@ install_optional_channel_plugin_dependencies() {
   for plugin_dir in "${OPTIONAL_CHANNEL_PLUGIN_DIRS[@]}"; do
     if [[ -f "$extensions_root/$plugin_dir/package.json" ]]; then
       echo "Installing bundled plugin dependencies for $plugin_dir..."
-      if ! PATH="$runtime_bin:$PATH" "$npm_binary" install --prefix "$extensions_root/$plugin_dir" --no-audit --no-fund --omit=dev; then
+      if ! PATH="$runtime_bin:$PATH" NPM_CONFIG_CACHE="$npm_cache" npm_config_cache="$npm_cache" "$npm_binary" install --prefix "$extensions_root/$plugin_dir" --no-audit --no-fund --omit=dev; then
         echo "Skipping optional plugin dependency install for $plugin_dir due to npm install failure." >&2
       fi
     fi
@@ -355,10 +365,7 @@ main() {
   download_and_extract_node
   download_and_extract_ollama
   install_openclaw
-  build_bundled_qqbot_plugin
   install_optional_channel_plugin_dependencies
-
-  printf "%s\n" "$OLLAMA_VERSION" >"$ENGINE_DIR/ollama/VERSION"
 
   if [[ ! -f "$ENGINE_DIR/templates/openclaw.json" ]]; then
     printf "{}\n" >"$ENGINE_DIR/templates/openclaw.json"
@@ -368,15 +375,15 @@ main() {
 Prepared whereclaw-engine successfully.
 
 Node version:      $NODE_VERSION
-OpenClaw package:  $OPENCLAW_PACKAGE
+OpenClaw package:  openclaw@latest
 Node runtime:      $NODE_RUNTIME_DIR
 Node binary:       $NODE_RUNTIME_DIR/bin/node
 NPM binary:        $NODE_RUNTIME_DIR/bin/npm
-Ollama version:    $OLLAMA_VERSION
+Ollama version:    $(cat "$ENGINE_DIR/ollama/VERSION")
 Ollama runtime:    $ENGINE_DIR/ollama/$ollama_platform_dir
 Ollama binary:     $ENGINE_DIR/ollama/$ollama_platform_dir/ollama
-OpenClaw entry:    $ENGINE_DIR/openclaw/node_modules/openclaw-cn/dist/entry.js
-Control UI:        $ENGINE_DIR/openclaw/node_modules/openclaw-cn/dist/control-ui/index.html
+OpenClaw entry:    $ENGINE_DIR/openclaw/node_modules/openclaw/openclaw.mjs
+Control UI:        $ENGINE_DIR/openclaw/node_modules/openclaw/dist/control-ui/index.html
 Runtime UI copy:   $NODE_RUNTIME_DIR/bin/control-ui/index.html
 EOF
 }

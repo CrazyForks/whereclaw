@@ -1,5 +1,6 @@
 import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { getModelStepUiState } from "./onboarding/modelStep.ts";
 import { getQqContinueButtonState } from "./onboarding/qqStep.ts";
@@ -100,35 +101,6 @@ type InstalledSkillEntry = {
   enabled: boolean;
 };
 
-type SkillCatalogEntry = {
-  slug: string;
-  name: string;
-  description?: string;
-  description_zh?: string;
-  version?: string;
-  homepage?: string;
-  tags?: string[];
-  downloads?: number;
-  stars?: number;
-  installs?: number;
-  updated_at?: number;
-  score?: number;
-};
-
-type SkillCatalog = {
-  total: number;
-  generated_at: string;
-  featured: string[];
-  categories: Record<string, string[]>;
-  skills: SkillCatalogEntry[];
-};
-
-type ActiveSkillCatalogPayload = {
-  version: string;
-  source: string;
-  catalog: SkillCatalog;
-};
-
 type SkillCatalogRefreshResult = {
   version: string;
   source: string;
@@ -175,39 +147,8 @@ function getRecommendedLocalModelName(
   return matchedModel?.name ?? FALLBACK_LOCAL_MODEL_NAME;
 }
 
-type SkillCatalogSort =
-  | "score-desc"
-  | "downloads-desc"
-  | "installs-desc"
-  | "updated-desc"
-  | "name-asc";
-
 type StatusLogLevel = "INFO" | "WARN" | "ERROR";
 type StatusLogContext = Record<string, unknown>;
-
-const skillBadgeColorPairs = [
-  "bg-rose-100 text-rose-700",
-  "bg-orange-100 text-orange-700",
-  "bg-amber-100 text-amber-700",
-  "bg-lime-100 text-lime-700",
-  "bg-emerald-100 text-emerald-700",
-  "bg-teal-100 text-teal-700",
-  "bg-sky-100 text-sky-700",
-  "bg-blue-100 text-blue-700",
-  "bg-indigo-100 text-indigo-700",
-  "bg-fuchsia-100 text-fuchsia-700",
-  "bg-pink-100 text-pink-700",
-];
-
-const skillCatalogCategoryDisplayNames: Record<string, string> = {
-  "AI 智能": "AI",
-  开发工具: "Developer Tools",
-  效率提升: "Productivity",
-  数据分析: "Data Analytics",
-  内容创作: "Content Creation",
-  安全合规: "Security & Compliance",
-  通讯协作: "Communication & Collaboration",
-};
 
 type InitialSetupConfigRequest = {
   localModel?: string;
@@ -228,8 +169,7 @@ type ConfigPage =
   | "local-model"
   | "channel"
   | "model"
-  | "skill"
-  | "skill-catalog";
+  | "skill";
 type LocalModelToggleAction = "enable" | "disable";
 type LogSource = "launcher" | "ollama" | "gateway";
 
@@ -407,8 +347,7 @@ type Copy = {
   statusStartGatewayWaitForModelDownload: (modelName: string) => string;
   loadInstalledSkillsFailed: string;
   toggleSkillFailed: string;
-  loadSkillCatalogFailed: string;
-  openCatalogSkillHomepageFailed: string;
+  openSkillCatalogFailed: string;
   installSkillFailed: string;
   installSkillSuccess: (slug: string) => string;
   removeSkillSuccess: (slug: string) => string;
@@ -450,28 +389,7 @@ type Copy = {
   disableSkill: string;
   enableSkill: string;
   deleteSkill: string;
-  skillCatalogTitle: string;
-  skillCatalogDescription: string;
   skillManagementBackAriaLabel: string;
-  searchSkills: string;
-  skillCatalogSearchPlaceholder: string;
-  sortSkills: string;
-  skillSortScore: string;
-  skillSortDownloads: string;
-  skillSortInstalls: string;
-  skillSortUpdated: string;
-  skillSortName: string;
-  loadingSkillCatalog: string;
-  skillCatalogUnavailable: string;
-  skillCatalogEmpty: string;
-  noDescription: string;
-  skillCatalogPagination: (start: number, end: number, total: number) => string;
-  previousPage: string;
-  nextPage: string;
-  versionPrefix: string;
-  skillCatalogSource: string;
-  installing: string;
-  installOneClick: string;
   removeSkillTitle: string;
   removeWorkspaceSkillConfirm: (slug: string) => string;
   removing: string;
@@ -672,8 +590,7 @@ const copyByLanguage: Record<LauncherLanguage, Copy> = {
       `Model ${modelName} is downloading. Wait for the download to finish, then start the gateway.`,
     loadInstalledSkillsFailed: "Failed to load installed skills.",
     toggleSkillFailed: "Failed to change skill status.",
-    loadSkillCatalogFailed: "Failed to load skill catalog.",
-    openCatalogSkillHomepageFailed: "Failed to open skill homepage.",
+    openSkillCatalogFailed: "Failed to open skill catalog.",
     installSkillFailed: "Failed to install skill.",
     installSkillSuccess: (slug) => `Skill ${slug} installed successfully.`,
     removeSkillSuccess: (slug) => `Skill ${slug} was removed.`,
@@ -699,7 +616,7 @@ const copyByLanguage: Record<LauncherLanguage, Copy> = {
       "Manage cloud and local model access, switching, and primary model settings.",
     configCenterSkillTitle: "Skill Management",
     configCenterSkillDescription:
-      "Review installed skills and distinguish workspace and bundled sources.",
+      "Browse the official ClawHub site and install skills through WhereClaw without command-line windows or zip downloads.",
     downloadPreparing: "Preparing download...",
     save: "Save",
     channelConfigDescription:
@@ -708,11 +625,11 @@ const copyByLanguage: Record<LauncherLanguage, Copy> = {
       "Review provider and local model setup, then save to switch the default primary model.",
     skillManagementTitle: "Skill Management",
     skillManagementDescription:
-      "Review installed skills visible to the current user, prioritizing workspace skills while keeping source details.",
+      "Open the official ClawHub site and install skills with one click in WhereClaw. No command-line windows, no zip downloads.",
     installedSkillsTitle: "Installed Skills",
     installedSkillsSummary: (count) =>
       `${count} total, grouped by workspace and bundled sources.`,
-    openSkillCatalog: "Open Skill Catalog",
+    openSkillCatalog: "Open ClawHub",
     refreshSkillList: "Refresh Skill List",
     loadingSkillList: "Loading installed skills...",
     installedSkillsEmpty: "No installed skills found.",
@@ -724,30 +641,7 @@ const copyByLanguage: Record<LauncherLanguage, Copy> = {
     disableSkill: "Disable Skill",
     enableSkill: "Enable Skill",
     deleteSkill: "Delete Skill",
-    skillCatalogTitle: "Skill Catalog",
-    skillCatalogDescription:
-      "Browse the root skill index with search, sorting, and pagination. 20 items per page, sorted by score by default.",
     skillManagementBackAriaLabel: "Back to skill management",
-    searchSkills: "Search skills",
-    skillCatalogSearchPlaceholder: "Search slug, name, description, or tags",
-    sortSkills: "Sort skills",
-    skillSortScore: "Score",
-    skillSortDownloads: "Downloads",
-    skillSortInstalls: "Installs",
-    skillSortUpdated: "Updated",
-    skillSortName: "Name",
-    loadingSkillCatalog: "Loading skill catalog...",
-    skillCatalogUnavailable: "Skill index not loaded yet.",
-    skillCatalogEmpty: "No matching skills.",
-    noDescription: "No description available",
-    skillCatalogPagination: (start, end, total) =>
-      `Showing ${start}-${end} of ${total} matching results`,
-    previousPage: "Previous",
-    nextPage: "Next",
-    versionPrefix: "Version",
-    skillCatalogSource: "Skill data is provided by ClawHub",
-    installing: "Installing...",
-    installOneClick: "Install",
     removeSkillTitle: "Delete Skill",
     removeWorkspaceSkillConfirm: (slug) =>
       `Delete workspace skill \`${slug}\`?`,
@@ -940,8 +834,7 @@ const copyByLanguage: Record<LauncherLanguage, Copy> = {
       `模型 ${modelName} 正在下载，请等待下载完成后再启动网关。`,
     loadInstalledSkillsFailed: "加载技能列表失败。",
     toggleSkillFailed: "切换技能状态失败。",
-    loadSkillCatalogFailed: "加载技能广场失败。",
-    openCatalogSkillHomepageFailed: "打开技能主页失败。",
+    openSkillCatalogFailed: "打开技能广场失败。",
     installSkillFailed: "安装技能失败。",
     installSkillSuccess: (slug) => `技能 ${slug} 安装成功。`,
     removeSkillSuccess: (slug) => `技能 ${slug} 已删除。`,
@@ -967,7 +860,7 @@ const copyByLanguage: Record<LauncherLanguage, Copy> = {
       "统一管理云端与本地模型的接入、切换和主模型设置，维护当前可用模型清单。",
     configCenterSkillTitle: "技能管理",
     configCenterSkillDescription:
-      "查看当前用户已安装的 skills，并区分用户目录与内置技能来源。",
+      "ClawHub官方镜像站，使用WhereClaw可以一键安装，告别命令行黑框和下载zip。",
     downloadPreparing: "准备下载中...",
     save: "保存",
     channelConfigDescription:
@@ -976,11 +869,11 @@ const copyByLanguage: Record<LauncherLanguage, Copy> = {
       "汇总所有服务商模型与本地模型的接入配置，点击模型后保存，可以切换默认主模型。",
     skillManagementTitle: "技能管理",
     skillManagementDescription:
-      "汇总当前用户可见的已安装 skills，优先展示用户目录中的技能，同时保留内置技能来源信息。",
+      "ClawHub官方镜像站，使用WhereClaw可以一键安装，告别命令行黑框和下载zip。",
     installedSkillsTitle: "已安装技能",
     installedSkillsSummary: (count) =>
       `共 ${count} 个，用户目录与内置目录会分别分组展示。`,
-    openSkillCatalog: "打开技能广场",
+    openSkillCatalog: "打开 ClawHub 官方镜像站",
     refreshSkillList: "刷新技能列表",
     loadingSkillList: "正在加载技能列表...",
     installedSkillsEmpty: "当前未发现已安装 skill。",
@@ -992,30 +885,7 @@ const copyByLanguage: Record<LauncherLanguage, Copy> = {
     disableSkill: "停用技能",
     enableSkill: "启用技能",
     deleteSkill: "删除技能",
-    skillCatalogTitle: "技能广场",
-    skillCatalogDescription:
-      "浏览根目录技能索引，支持搜索、排序和分页。当前每页显示 20 条，默认按综合排序展示。",
     skillManagementBackAriaLabel: "返回技能管理",
-    searchSkills: "搜索技能",
-    skillCatalogSearchPlaceholder: "搜索 slug、名称、描述、标签",
-    sortSkills: "排序方式",
-    skillSortScore: "综合",
-    skillSortDownloads: "下载量",
-    skillSortInstalls: "安装量",
-    skillSortUpdated: "更新时间",
-    skillSortName: "名称",
-    loadingSkillCatalog: "正在加载技能广场...",
-    skillCatalogUnavailable: "暂未加载技能索引。",
-    skillCatalogEmpty: "没有匹配的技能。",
-    noDescription: "暂无描述",
-    skillCatalogPagination: (start, end, total) =>
-      `当前显示第 ${start}-${end} 条，共 ${total} 条匹配结果`,
-    previousPage: "上一页",
-    nextPage: "下一页",
-    versionPrefix: "版本",
-    skillCatalogSource: "技能数据来源于 ClawHub",
-    installing: "安装中...",
-    installOneClick: "一键安装",
     removeSkillTitle: "删除技能",
     removeWorkspaceSkillConfirm: (slug) =>
       `确认删除工作区技能 \`${slug}\` 吗？`,
@@ -1095,21 +965,8 @@ export default function App() {
     managed: true,
   });
   const [togglingSkillKey, setTogglingSkillKey] = useState<string | null>(null);
-  const [isSkillCatalogLoading, setIsSkillCatalogLoading] = useState(false);
-  const [skillCatalog, setSkillCatalog] = useState<SkillCatalog | null>(null);
-  const [skillCatalogSearch, setSkillCatalogSearch] = useState("");
-  const [skillCatalogSort, setSkillCatalogSort] =
-    useState<SkillCatalogSort>("score-desc");
-  const [skillCatalogPage, setSkillCatalogPage] = useState(1);
-  const [activeSkillCategory, setActiveSkillCategory] = useState<string | null>(
-    null,
-  );
-  const [selectedCatalogSkill, setSelectedCatalogSkill] =
-    useState<SkillCatalogEntry | null>(null);
-  const [isInstallingCatalogSkill, setIsInstallingCatalogSkill] =
+  const [isOpeningClawhubMarketplace, setIsOpeningClawhubMarketplace] =
     useState(false);
-  const [catalogInstallSuccessMessage, setCatalogInstallSuccessMessage] =
-    useState("");
   const [removingWorkspaceSkillSlug, setRemovingWorkspaceSkillSlug] = useState<
     string | null
   >(null);
@@ -1154,7 +1011,6 @@ export default function App() {
     useState<SystemMemoryInfo | null>(null);
   const [memoryInfoFailed, setMemoryInfoFailed] = useState(false);
   const [appVersion, setAppVersion] = useState<string | null>(null);
-  const [skillsCatalogVersion, setSkillsCatalogVersion] = useState<string | null>(null);
   const [remoteNotifications, setRemoteNotifications] = useState<RemoteNotificationsPayload | null>(null);
   const [remoteDesktopVersion, setRemoteDesktopVersion] = useState<string | null>(null);
   const [hasDesktopUpdate, setHasDesktopUpdate] = useState(false);
@@ -1220,7 +1076,6 @@ export default function App() {
         "ensure_remote_skill_catalog_fresh",
       )
         .then(async (result) => {
-          setSkillsCatalogVersion(result.version);
           setRemoteDesktopVersion(result.desktopVersion);
           setHasDesktopUpdate(result.desktopUpdateAvailable);
           try {
@@ -1234,7 +1089,6 @@ export default function App() {
           return result;
         })
         .catch(async () => {
-          setSkillsCatalogVersion((current) => current ?? null);
           setRemoteNotifications(null);
           try {
             const desktopVersion = await invoke<RemoteDesktopVersionPayload>(
@@ -1383,91 +1237,6 @@ export default function App() {
         (sourceOrder.get(left) ?? 99) - (sourceOrder.get(right) ?? 99),
     );
   }, [installedSkills]);
-  const skillCatalogCategories = useMemo(
-    () => Object.entries(skillCatalog?.categories ?? {}),
-    [skillCatalog],
-  );
-  const filteredSkillCatalogEntries = useMemo(() => {
-    const entries = skillCatalog?.skills ?? [];
-    const keyword = skillCatalogSearch.trim().toLowerCase();
-    const activeCategoryKeywords =
-      activeSkillCategory && skillCatalog?.categories[activeSkillCategory]
-        ? skillCatalog.categories[activeSkillCategory]
-        : null;
-    const filtered =
-      keyword.length === 0
-        ? [...entries]
-        : entries.filter((entry) => {
-            const haystack = [
-              entry.slug,
-              entry.name,
-              entry.description,
-              entry.description_zh,
-              entry.homepage,
-              ...(entry.tags ?? []),
-            ]
-              .filter(Boolean)
-              .join(" ")
-              .toLowerCase();
-            return haystack.includes(keyword);
-          });
-
-    const categoryFiltered =
-      activeCategoryKeywords && activeCategoryKeywords.length > 0
-        ? filtered.filter((entry) => {
-            const haystack = [
-              entry.slug,
-              entry.name,
-              entry.description,
-              entry.description_zh,
-              entry.homepage,
-              ...(entry.tags ?? []),
-            ]
-              .filter(Boolean)
-              .join(" ")
-              .toLowerCase();
-            return activeCategoryKeywords.some((categoryKeyword) =>
-              haystack.includes(categoryKeyword.toLowerCase()),
-            );
-          })
-        : filtered;
-
-    categoryFiltered.sort((left, right) => {
-      switch (skillCatalogSort) {
-        case "downloads-desc":
-          return (right.downloads ?? 0) - (left.downloads ?? 0);
-        case "installs-desc":
-          return (right.installs ?? 0) - (left.installs ?? 0);
-        case "updated-desc":
-          return (right.updated_at ?? 0) - (left.updated_at ?? 0);
-        case "name-asc":
-          return left.name.localeCompare(right.name, selectedLanguage);
-        case "score-desc":
-        default:
-          return (right.score ?? 0) - (left.score ?? 0);
-      }
-    });
-
-    return categoryFiltered;
-  }, [
-    activeSkillCategory,
-    selectedLanguage,
-    skillCatalog,
-    skillCatalogSearch,
-    skillCatalogSort,
-  ]);
-  const skillCatalogPageSize = 20;
-  const skillCatalogTotalPages = Math.max(
-    1,
-    Math.ceil(filteredSkillCatalogEntries.length / skillCatalogPageSize),
-  );
-  const pagedSkillCatalogEntries = useMemo(() => {
-    const startIndex = (skillCatalogPage - 1) * skillCatalogPageSize;
-    return filteredSkillCatalogEntries.slice(
-      startIndex,
-      startIndex + skillCatalogPageSize,
-    );
-  }, [filteredSkillCatalogEntries, skillCatalogPage]);
   const visibleLocalModels = useMemo(() => {
     const hiddenDownloadingModel = shouldShowLocalDownloadProgress
       ? localModelRunProgress?.model.trim() || pendingLocalDownloadModel.trim()
@@ -2351,57 +2120,18 @@ export default function App() {
     }
   };
 
-  const loadSkillCatalog = async () => {
-    if (skillCatalog) return;
-    setIsSkillCatalogLoading(true);
+  const handleOpenClawhubMarketplace = async () => {
+    setIsOpeningClawhubMarketplace(true);
     try {
-      await ensureRemoteSkillCatalogFresh();
-      const payload = await invoke<ActiveSkillCatalogPayload>(
-        "read_active_skill_catalog",
-      );
-      setSkillCatalog(payload.catalog);
-      setSkillsCatalogVersion(payload.version);
+      await invoke("open_clawhub_marketplace_window", {
+        language: selectedLanguage,
+      });
     } catch (error) {
-      showStatusError(error, copy.loadSkillCatalogFailed, {
-        action: "loadSkillCatalog",
+      showStatusError(error, copy.openSkillCatalogFailed, {
+        action: "handleOpenClawhubMarketplace",
       });
     } finally {
-      setIsSkillCatalogLoading(false);
-    }
-  };
-
-  const handleOpenCatalogSkillHomepage = async (homepage?: string) => {
-    const url = homepage?.trim();
-    if (!url) return;
-    try {
-      await invoke("open_external_url", { url });
-    } catch (error) {
-      showStatusError(error, copy.openCatalogSkillHomepageFailed, {
-        action: "handleOpenCatalogSkillHomepage",
-        url,
-      });
-    }
-  };
-
-  const handleInstallCatalogSkill = async (slug: string) => {
-    const normalizedSlug = slug.trim();
-    if (normalizedSlug.length === 0) return;
-    setIsInstallingCatalogSkill(true);
-    try {
-      await invoke("install_skill_from_catalog", { slug: normalizedSlug });
-      await loadInstalledSkills();
-      setCatalogInstallSuccessMessage(copy.installSkillSuccess(normalizedSlug));
-      setSelectedCatalogSkill(null);
-      await new Promise((resolve) => window.setTimeout(resolve, 1000));
-      setCatalogInstallSuccessMessage("");
-      setConfigPage("skill");
-    } catch (error) {
-      showStatusError(error, copy.installSkillFailed, {
-        action: "handleInstallCatalogSkill",
-        slug: normalizedSlug,
-      });
-    } finally {
-      setIsInstallingCatalogSkill(false);
+      setIsOpeningClawhubMarketplace(false);
     }
   };
 
@@ -2845,22 +2575,29 @@ export default function App() {
   }, [configPage, currentOpenClawModel?.key]);
 
   useEffect(() => {
-    setSkillCatalogPage(1);
-  }, [skillCatalogSearch, skillCatalogSort]);
-
-  useEffect(() => {
-    setSkillCatalogPage(1);
-  }, [activeSkillCategory]);
-
-  useEffect(() => {
-    if (skillCatalogPage <= skillCatalogTotalPages) return;
-    setSkillCatalogPage(skillCatalogTotalPages);
-  }, [skillCatalogPage, skillCatalogTotalPages]);
-
-  useEffect(() => {
-    if (configPage !== "skill-catalog") return;
+    if (configPage !== "skill") return;
     contentScrollContainerRef.current?.scrollTo({ top: 0, behavior: "smooth" });
-  }, [configPage, skillCatalogPage]);
+  }, [configPage]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+
+    void listen<string>("clawhub-skill-installed", () => {
+      void loadInstalledSkills();
+    }).then((nextUnlisten) => {
+      if (disposed) {
+        nextUnlisten();
+      } else {
+        unlisten = nextUnlisten;
+      }
+    });
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
 
   if (shouldShowLaunchSplash) {
     return (
@@ -4294,14 +4031,16 @@ export default function App() {
                           <div className="flex items-center gap-2">
                             <button
                               className={configAddIconButtonClass}
-                              onClick={() => {
-                                setConfigPage("skill-catalog");
-                                void loadSkillCatalog();
-                              }}
+                              disabled={isOpeningClawhubMarketplace}
+                              onClick={() => void handleOpenClawhubMarketplace()}
                               title={copy.openSkillCatalog}
                               type="button"
                             >
-                              <PlusIcon />
+                              {isOpeningClawhubMarketplace ? (
+                                <SpinnerIcon />
+                              ) : (
+                                <PlusIcon />
+                              )}
                             </button>
                             <button
                               className={configAddIconButtonClass}
@@ -4494,250 +4233,6 @@ export default function App() {
                   </div>
                 ) : null}
 
-                {configPage === "skill-catalog" ? (
-                  <div className="space-y-4">
-                    <div className="space-y-3 px-1 pt-1">
-                      <button
-                        aria-label={copy.skillManagementBackAriaLabel}
-                        className={configBackButtonClass}
-                        onClick={() => setConfigPage("skill")}
-                        type="button"
-                      >
-                        <ChevronLeftIcon />
-                      </button>
-                      <div className="flex items-center gap-2 text-base text-slate-400">
-                        <button
-                          className="transition hover:text-slate-700"
-                          onClick={() => setConfigPage("skill")}
-                          type="button"
-                        >
-                          {copy.skillManagementTitle}
-                        </button>
-                        <span>/</span>
-                        <span className="text-slate-600">
-                          {copy.skillCatalogTitle}
-                        </span>
-                      </div>
-                      <p className="mt-1 text-xs text-slate-500">
-                        {copy.skillCatalogDescription}
-                      </p>
-                      {skillsCatalogVersion ? (
-                        <p className="text-xs text-slate-400">
-                          {copy.versionPrefix}: {skillsCatalogVersion} · {copy.skillCatalogSource}
-                        </p>
-                      ) : null}
-                    </div>
-
-                    <section className="rounded-3xl border border-white/85 bg-white/70 p-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.9)] backdrop-blur-xl">
-                      <div className="space-y-4">
-                        <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_8.5rem]">
-                          <label className="block">
-                            <span className="sr-only">{copy.searchSkills}</span>
-                            <input
-                              className={compactInputClass}
-                              onChange={(event) => {
-                                setSkillCatalogSearch(event.target.value);
-                                setActiveSkillCategory(null);
-                              }}
-                              placeholder={copy.skillCatalogSearchPlaceholder}
-                              type="text"
-                              value={skillCatalogSearch}
-                            />
-                          </label>
-                          <label className="block">
-                            <span className="sr-only">{copy.sortSkills}</span>
-                            <select
-                              className={compactInputClass}
-                              onChange={(event) =>
-                                setSkillCatalogSort(
-                                  event.target.value as SkillCatalogSort,
-                                )
-                              }
-                              value={skillCatalogSort}
-                            >
-                              <option value="score-desc">
-                                {copy.skillSortScore}
-                              </option>
-                              <option value="downloads-desc">
-                                {copy.skillSortDownloads}
-                              </option>
-                              <option value="installs-desc">
-                                {copy.skillSortInstalls}
-                              </option>
-                              <option value="updated-desc">
-                                {copy.skillSortUpdated}
-                              </option>
-                              <option value="name-asc">
-                                {copy.skillSortName}
-                              </option>
-                            </select>
-                          </label>
-                        </div>
-
-                        {skillCatalogCategories.length > 0 ? (
-                          <div className="rounded-[1rem] border border-slate-200/80 bg-slate-50/80 p-4">
-                            <div className="grid grid-cols-7 gap-2">
-                              {skillCatalogCategories.map(([categoryName]) => {
-                                const categoryLabel =
-                                  getSkillCatalogCategoryLabel(
-                                    categoryName,
-                                    selectedLanguage,
-                                  );
-
-                                return (
-                                  <button
-                                    key={categoryName}
-                                    className={`flex min-w-0 flex-col items-center justify-center gap-2 rounded-[1rem] border px-2 py-3 text-center transition ${
-                                      activeSkillCategory === categoryName
-                                        ? "border-[#007AFF]/35 bg-[#007AFF]/[0.05]"
-                                        : "border-white/90 bg-white/80 hover:border-[#007AFF]/20 hover:bg-[#007AFF]/[0.025]"
-                                    }`}
-                                    onClick={() =>
-                                      setActiveSkillCategory((current) =>
-                                        current === categoryName
-                                          ? null
-                                          : categoryName,
-                                      )
-                                    }
-                                    type="button"
-                                  >
-                                    <span
-                                      className={`inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full ${getSkillBadgeColorClass(categoryName)}`}
-                                    >
-                                      <SkillCategoryIcon
-                                        category={categoryName}
-                                      />
-                                    </span>
-                                    <span className="block text-xs font-semibold leading-4 text-slate-900">
-                                      {categoryLabel}
-                                    </span>
-                                  </button>
-                                );
-                              })}
-                            </div>
-                          </div>
-                        ) : null}
-
-                        {isSkillCatalogLoading ? (
-                          <p className="text-sm text-slate-500">
-                            {copy.loadingSkillCatalog}
-                          </p>
-                        ) : !skillCatalog ? (
-                          <p className="text-sm text-slate-500">
-                            {copy.skillCatalogUnavailable}
-                          </p>
-                        ) : filteredSkillCatalogEntries.length === 0 ? (
-                          <p className="text-sm text-slate-500">
-                            {copy.skillCatalogEmpty}
-                          </p>
-                        ) : (
-                          <>
-                            <div className="grid gap-3 md:grid-cols-2">
-                              {pagedSkillCatalogEntries.map((entry) => (
-                                <button
-                                  key={entry.slug}
-                                  className="rounded-[1rem] border border-slate-200 bg-white px-4 py-3 text-left transition hover:border-[#007AFF]/25 hover:bg-[#007AFF]/[0.025]"
-                                  onClick={() => setSelectedCatalogSkill(entry)}
-                                  type="button"
-                                >
-                                  <div className="flex items-start justify-between gap-3">
-                                    <div className="flex min-w-0 items-start gap-3">
-                                      <span
-                                        className={`inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-sm font-semibold uppercase ${getSkillBadgeColorClass(entry.slug || entry.name)}`}
-                                      >
-                                        {entry.name.trim().charAt(0) || "S"}
-                                      </span>
-                                      <div className="min-w-0">
-                                        <p className="truncate text-sm font-semibold text-slate-900">
-                                          {entry.name}
-                                        </p>
-                                        <p className="mt-1 truncate text-xs text-slate-500">
-                                          {entry.slug}
-                                        </p>
-                                      </div>
-                                    </div>
-                                    <span className="inline-flex shrink-0 items-center rounded-full bg-slate-100 px-2 py-0.5 text-[0.68rem] font-medium text-slate-600">
-                                      {entry.version || "--"}
-                                    </span>
-                                  </div>
-                                  <p className="mt-2 max-h-[3.75rem] overflow-hidden text-xs leading-5 text-slate-600">
-                                    {selectedLanguage === "zh-CN"
-                                      ? entry.description_zh ||
-                                        entry.description ||
-                                        copy.noDescription
-                                      : entry.description ||
-                                        entry.description_zh ||
-                                        copy.noDescription}
-                                  </p>
-                                  <div className="mt-3 flex flex-wrap gap-2 text-[0.7rem] text-slate-400">
-                                    <span className="inline-flex items-center gap-1 rounded-full bg-slate-50 px-2 py-1">
-                                      <DownloadStatIcon />
-                                      <span>{entry.downloads ?? 0}</span>
-                                    </span>
-                                    <span className="inline-flex items-center gap-1 rounded-full bg-slate-50 px-2 py-1">
-                                      <StarStatIcon />
-                                      <span>{entry.stars ?? 0}</span>
-                                    </span>
-                                    <span className="inline-flex items-center gap-1 rounded-full bg-slate-50 px-2 py-1">
-                                      <InstallStatIcon />
-                                      <span>{entry.installs ?? 0}</span>
-                                    </span>
-                                  </div>
-                                </button>
-                              ))}
-                            </div>
-
-                            <div className="flex items-center justify-between gap-3 rounded-[1rem] border border-slate-200/80 bg-slate-50/80 px-4 py-3">
-                              <p className="text-xs text-slate-500">
-                                {copy.skillCatalogPagination(
-                                  (skillCatalogPage - 1) *
-                                    skillCatalogPageSize +
-                                    1,
-                                  Math.min(
-                                    skillCatalogPage * skillCatalogPageSize,
-                                    filteredSkillCatalogEntries.length,
-                                  ),
-                                  filteredSkillCatalogEntries.length,
-                                )}
-                              </p>
-                              <div className="flex items-center gap-2">
-                                <button
-                                  className={secondaryButtonClass}
-                                  disabled={skillCatalogPage <= 1}
-                                  onClick={() =>
-                                    setSkillCatalogPage((current) =>
-                                      Math.max(1, current - 1),
-                                    )
-                                  }
-                                  type="button"
-                                >
-                                  {copy.previousPage}
-                                </button>
-                                <button
-                                  className={secondaryButtonClass}
-                                  disabled={
-                                    skillCatalogPage >= skillCatalogTotalPages
-                                  }
-                                  onClick={() =>
-                                    setSkillCatalogPage((current) =>
-                                      Math.min(
-                                        skillCatalogTotalPages,
-                                        current + 1,
-                                      ),
-                                    )
-                                  }
-                                  type="button"
-                                >
-                                  {copy.nextPage}
-                                </button>
-                              </div>
-                            </div>
-                          </>
-                        )}
-                      </div>
-                    </section>
-                  </div>
-                ) : null}
               </div>
             ) : null}
 
@@ -5161,122 +4656,6 @@ export default function App() {
         </div>
       ) : null}
 
-      {selectedCatalogSkill ? (
-        <div
-          className={modalOverlayClass}
-          onClick={() => {
-            if (isInstallingCatalogSkill) return;
-            setSelectedCatalogSkill(null);
-          }}
-        >
-          <section
-            className={`w-full max-w-lg ${modalPanelClass}`}
-            onClick={(event) => event.stopPropagation()}
-          >
-            <div className="flex items-start justify-between gap-3">
-              <div className="flex min-w-0 items-start gap-3">
-                <span
-                  className={`inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-base font-semibold uppercase ${getSkillBadgeColorClass(
-                    selectedCatalogSkill.slug || selectedCatalogSkill.name,
-                  )}`}
-                >
-                  {selectedCatalogSkill.name.trim().charAt(0) || "S"}
-                </span>
-                <div className="min-w-0">
-                  <h3 className="truncate text-lg font-semibold text-slate-950">
-                    {selectedCatalogSkill.name}
-                  </h3>
-                  <p className="mt-1 truncate text-xs text-slate-500">
-                    {selectedCatalogSkill.slug}
-                  </p>
-                </div>
-              </div>
-              <button
-                className={closeIconButtonClass}
-                disabled={isInstallingCatalogSkill}
-                onClick={() => setSelectedCatalogSkill(null)}
-                title={copy.close}
-                type="button"
-              >
-                <CloseIcon />
-              </button>
-            </div>
-
-            <div className="mt-4 space-y-4">
-              <div className="flex flex-wrap gap-2 text-[0.72rem] text-slate-500">
-                <span className="inline-flex items-center rounded-full bg-slate-100 px-2.5 py-1">
-                  {copy.versionPrefix} {selectedCatalogSkill.version || "--"}
-                </span>
-                <span className="inline-flex items-center gap-1 rounded-full bg-slate-100 px-2.5 py-1">
-                  <DownloadStatIcon />
-                  <span>{selectedCatalogSkill.downloads ?? 0}</span>
-                </span>
-                <span className="inline-flex items-center gap-1 rounded-full bg-slate-100 px-2.5 py-1">
-                  <StarStatIcon />
-                  <span>{selectedCatalogSkill.stars ?? 0}</span>
-                </span>
-                <span className="inline-flex items-center gap-1 rounded-full bg-slate-100 px-2.5 py-1">
-                  <InstallStatIcon />
-                  <span>{selectedCatalogSkill.installs ?? 0}</span>
-                </span>
-              </div>
-
-              <div>
-                <p className="text-sm leading-6 text-slate-600">
-                  {selectedLanguage === "zh-CN"
-                    ? selectedCatalogSkill.description_zh ||
-                      selectedCatalogSkill.description ||
-                      copy.noDescription
-                    : selectedCatalogSkill.description ||
-                      selectedCatalogSkill.description_zh ||
-                      copy.noDescription}
-                </p>
-                <button
-                  className="mt-2 text-left text-xs text-slate-400 transition hover:text-slate-600"
-                  onClick={() =>
-                    void handleOpenCatalogSkillHomepage("https://clawhub.ai")
-                  }
-                  type="button"
-                >
-                  {copy.skillCatalogSource}
-                </button>
-              </div>
-            </div>
-
-            <div className="mt-5 flex items-center justify-end gap-2">
-              <button
-                className={tertiaryButtonClass}
-                disabled={isInstallingCatalogSkill}
-                onClick={() => setSelectedCatalogSkill(null)}
-                type="button"
-              >
-                {copy.close}
-              </button>
-              <button
-                className="cursor-pointer rounded-xl bg-[#007AFF] px-3 py-2 text-xs font-semibold text-white shadow-[0_10px_24px_rgba(0,122,255,0.28)] transition-all duration-200 hover:bg-[#006AE6] active:scale-95 disabled:cursor-not-allowed disabled:opacity-50"
-                disabled={isInstallingCatalogSkill}
-                onClick={() =>
-                  void handleInstallCatalogSkill(selectedCatalogSkill.slug)
-                }
-                type="button"
-              >
-                {isInstallingCatalogSkill
-                  ? copy.installing
-                  : copy.installOneClick}
-              </button>
-            </div>
-          </section>
-        </div>
-      ) : null}
-
-      {catalogInstallSuccessMessage ? (
-        <div className="pointer-events-none fixed inset-0 z-[90] flex items-center justify-center bg-slate-950/8 px-4">
-          <div className="rounded-3xl border border-emerald-200 bg-white/96 px-6 py-5 text-base font-medium text-emerald-700 shadow-[0_24px_60px_rgba(15,23,42,0.18)] backdrop-blur-xl">
-            {catalogInstallSuccessMessage}
-          </div>
-        </div>
-      ) : null}
-
       {pendingWorkspaceSkillRemoval ? (
         <div className={modalOverlayClass}>
           <section className={`w-full max-w-sm ${modalPanelClass}`}>
@@ -5372,14 +4751,6 @@ function serializeErrorForLog(error: unknown) {
     };
   }
   return { type: typeof error, value: error ?? null };
-}
-
-function getSkillBadgeColorClass(value: string) {
-  let hash = 0;
-  for (let index = 0; index < value.length; index += 1) {
-    hash = (hash * 31 + value.charCodeAt(index)) >>> 0;
-  }
-  return skillBadgeColorPairs[hash % skillBadgeColorPairs.length];
 }
 
 function looksLikeCloudModelName(model: string) {
@@ -5681,89 +5052,6 @@ function RefreshIcon() {
   );
 }
 
-function DownloadStatIcon() {
-  return (
-    <svg
-      aria-hidden="true"
-      className="h-3.5 w-3.5"
-      fill="none"
-      viewBox="0 0 24 24"
-    >
-      <path
-        d="M12 5V13.5"
-        stroke="currentColor"
-        strokeLinecap="round"
-        strokeWidth="1.8"
-      />
-      <path
-        d="M8.5 10.5L12 14L15.5 10.5"
-        stroke="currentColor"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        strokeWidth="1.8"
-      />
-      <path
-        d="M6 18H18"
-        stroke="currentColor"
-        strokeLinecap="round"
-        strokeWidth="1.8"
-      />
-    </svg>
-  );
-}
-
-function StarStatIcon() {
-  return (
-    <svg
-      aria-hidden="true"
-      className="h-3.5 w-3.5"
-      fill="none"
-      viewBox="0 0 24 24"
-    >
-      <path
-        d="M12 4.75L14.24 9.29L19.25 10.02L15.62 13.55L16.48 18.54L12 16.19L7.52 18.54L8.38 13.55L4.75 10.02L9.76 9.29L12 4.75Z"
-        stroke="currentColor"
-        strokeLinejoin="round"
-        strokeWidth="1.6"
-      />
-    </svg>
-  );
-}
-
-function InstallStatIcon() {
-  return (
-    <svg
-      aria-hidden="true"
-      className="h-3.5 w-3.5"
-      fill="none"
-      viewBox="0 0 24 24"
-    >
-      <path
-        d="M12 5V13"
-        stroke="currentColor"
-        strokeLinecap="round"
-        strokeWidth="1.8"
-      />
-      <path
-        d="M8 11L12 15L16 11"
-        stroke="currentColor"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        strokeWidth="1.8"
-      />
-      <rect
-        height="3.5"
-        rx="1"
-        stroke="currentColor"
-        strokeWidth="1.8"
-        width="12"
-        x="6"
-        y="16"
-      />
-    </svg>
-  );
-}
-
 function DeleteIcon() {
   return (
     <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
@@ -5800,191 +5088,6 @@ function DeleteIcon() {
       />
     </svg>
   );
-}
-
-function SkillCategoryIcon({ category }: { category: string }) {
-  const normalizedCategory = category.toLowerCase();
-  if (normalizedCategory.includes("ai")) {
-    return (
-      <svg
-        aria-hidden="true"
-        className="h-4 w-4"
-        fill="none"
-        viewBox="0 0 24 24"
-      >
-        <path
-          d="M12 4L14.4 9.6L20 12L14.4 14.4L12 20L9.6 14.4L4 12L9.6 9.6L12 4Z"
-          stroke="currentColor"
-          strokeLinejoin="round"
-          strokeWidth="1.8"
-        />
-      </svg>
-    );
-  }
-  if (
-    normalizedCategory.includes("开发") ||
-    normalizedCategory.includes("developer")
-  ) {
-    return (
-      <svg
-        aria-hidden="true"
-        className="h-4 w-4"
-        fill="none"
-        viewBox="0 0 24 24"
-      >
-        <path
-          d="M8 8L4 12L8 16"
-          stroke="currentColor"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          strokeWidth="1.8"
-        />
-        <path
-          d="M16 8L20 12L16 16"
-          stroke="currentColor"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          strokeWidth="1.8"
-        />
-      </svg>
-    );
-  }
-  if (
-    normalizedCategory.includes("效率") ||
-    normalizedCategory.includes("productivity")
-  ) {
-    return (
-      <svg
-        aria-hidden="true"
-        className="h-4 w-4"
-        fill="none"
-        viewBox="0 0 24 24"
-      >
-        <circle cx="12" cy="12" r="7" stroke="currentColor" strokeWidth="1.8" />
-        <path
-          d="M12 8V12L14.5 14.5"
-          stroke="currentColor"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          strokeWidth="1.8"
-        />
-      </svg>
-    );
-  }
-  if (
-    normalizedCategory.includes("数据") ||
-    normalizedCategory.includes("data")
-  ) {
-    return (
-      <svg
-        aria-hidden="true"
-        className="h-4 w-4"
-        fill="none"
-        viewBox="0 0 24 24"
-      >
-        <path
-          d="M6 18V10"
-          stroke="currentColor"
-          strokeLinecap="round"
-          strokeWidth="1.8"
-        />
-        <path
-          d="M12 18V6"
-          stroke="currentColor"
-          strokeLinecap="round"
-          strokeWidth="1.8"
-        />
-        <path
-          d="M18 18V13"
-          stroke="currentColor"
-          strokeLinecap="round"
-          strokeWidth="1.8"
-        />
-      </svg>
-    );
-  }
-  if (
-    normalizedCategory.includes("内容") ||
-    normalizedCategory.includes("content")
-  ) {
-    return (
-      <svg
-        aria-hidden="true"
-        className="h-4 w-4"
-        fill="none"
-        viewBox="0 0 24 24"
-      >
-        <path
-          d="M7 6.5H17"
-          stroke="currentColor"
-          strokeLinecap="round"
-          strokeWidth="1.8"
-        />
-        <path
-          d="M7 12H17"
-          stroke="currentColor"
-          strokeLinecap="round"
-          strokeWidth="1.8"
-        />
-        <path
-          d="M7 17.5H13"
-          stroke="currentColor"
-          strokeLinecap="round"
-          strokeWidth="1.8"
-        />
-      </svg>
-    );
-  }
-  if (
-    normalizedCategory.includes("安全") ||
-    normalizedCategory.includes("security")
-  ) {
-    return (
-      <svg
-        aria-hidden="true"
-        className="h-4 w-4"
-        fill="none"
-        viewBox="0 0 24 24"
-      >
-        <path
-          d="M12 4L18 7V11.5C18 15 15.7 18.1 12 20C8.3 18.1 6 15 6 11.5V7L12 4Z"
-          stroke="currentColor"
-          strokeLinejoin="round"
-          strokeWidth="1.8"
-        />
-      </svg>
-    );
-  }
-  return (
-    <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
-      <path
-        d="M7 8H17"
-        stroke="currentColor"
-        strokeLinecap="round"
-        strokeWidth="1.8"
-      />
-      <path
-        d="M7 12H17"
-        stroke="currentColor"
-        strokeLinecap="round"
-        strokeWidth="1.8"
-      />
-      <path
-        d="M7 16H14"
-        stroke="currentColor"
-        strokeLinecap="round"
-        strokeWidth="1.8"
-      />
-    </svg>
-  );
-}
-
-function getSkillCatalogCategoryLabel(
-  categoryName: string,
-  language: LauncherLanguage,
-) {
-  if (language !== "en") return categoryName;
-  return skillCatalogCategoryDisplayNames[categoryName] ?? categoryName;
 }
 
 function OverviewIcon() {

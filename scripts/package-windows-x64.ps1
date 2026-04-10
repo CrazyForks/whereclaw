@@ -109,7 +109,7 @@ try {
   Invoke-Step 'prepare:openclaw-engine:windows' { npm run prepare:openclaw-engine:windows }
   Invoke-Step 'tauri build' { npm run tauri build -- --target $Target --no-bundle }
 
-  $SourceExtensionsRoot = Join-Path $RootDir 'whereclaw-engine\openclaw\node_modules\openclaw-cn\extensions'
+  $SourceExtensionsRoot = Join-Path $RootDir 'whereclaw-engine\openclaw\node_modules\openclaw\dist\extensions'
   Remove-UnsafeExtensionPluginArtifacts -ExtensionsRoot $SourceExtensionsRoot
 
   Remove-PathSafely -PathValue $ZipPath
@@ -117,7 +117,7 @@ try {
   New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
   Copy-Item (Join-Path $ReleaseDir 'app.exe') (Join-Path $PortableRoot 'WhereClaw.exe')
   Invoke-Robocopy -Source (Join-Path $RootDir 'whereclaw-engine') -Destination (Join-Path $PortableRoot 'whereclaw-engine') -Label 'Copy whereclaw-engine'
-  Remove-UnsafeExtensionPluginArtifacts -ExtensionsRoot (Join-Path $PortableRoot 'whereclaw-engine\openclaw\node_modules\openclaw-cn\extensions')
+  Remove-UnsafeExtensionPluginArtifacts -ExtensionsRoot (Join-Path $PortableRoot 'whereclaw-engine\openclaw\node_modules\openclaw\dist\extensions')
 
   Push-Location $StageRoot
   try {

@@ -1,8 +1,5 @@
 param(
-  [string]$OpenClawPackage = "openclaw-cn@latest",
-  [string]$NodeVersion = "22.20.0",
-  [string]$OllamaVersion = "0.17.7",
-  [string]$QqBotPackage = "@sliverp/qqbot@latest"
+  [string]$NodeVersion = "22.20.0"
 )
 
 $ErrorActionPreference = "Stop"
@@ -20,6 +17,7 @@ $EngineDir = Join-Path $RootDir "whereclaw-engine"
 $NodeRuntimeDir = Join-Path $EngineDir "node-runtime"
 $OllamaRootDir = Join-Path $EngineDir "ollama"
 $TempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("whereclaw-engine-" + [System.Guid]::NewGuid().ToString("N"))
+$NpmCacheDir = Join-Path $TempDir "npm-cache"
 $OptionalChannelPluginDirs = @(
   "bluebubbles",
   "feishu",
@@ -181,78 +179,8 @@ function Remove-UnsafePluginLocalLinks {
   }
 }
 
-function Build-BundledQqbotPlugin {
-  $PluginRoot = Join-Path $EngineDir "openclaw\node_modules\openclaw-cn\extensions\qqbot"
-  $PackDir = Join-Path $TempDir "qqbot-pack"
-  $ExtractDir = Join-Path $TempDir "qqbot-extract"
-
-  Write-Host "Bundling real qqbot plugin from $QqBotPackage..."
-
-  Remove-DirectoryIfExists $PackDir
-  Remove-DirectoryIfExists $ExtractDir
-  Remove-DirectoryIfExists $PluginRoot
-  New-Item -ItemType Directory -Force -Path $PackDir | Out-Null
-  New-Item -ItemType Directory -Force -Path $ExtractDir | Out-Null
-
-  $OriginalPath = $env:Path
-  try {
-    $env:Path = "$NodeRuntimeDir;$OriginalPath"
-    Push-Location $PackDir
-    try {
-      & $NpmCmd pack $QqBotPackage
-      if ($LASTEXITCODE -ne 0) {
-        throw "npm pack exited with code $LASTEXITCODE"
-      }
-    }
-    finally {
-      Pop-Location
-    }
-  }
-  finally {
-    $env:Path = $OriginalPath
-  }
-
-  $Tarball = Get-ChildItem -Path $PackDir -Filter "*.tgz" | Select-Object -First 1
-  if (-not $Tarball) {
-    throw "Failed to download $QqBotPackage tarball during bundling."
-  }
-
-  tar.exe -xf $Tarball.FullName -C $ExtractDir
-  if ($LASTEXITCODE -ne 0) {
-    throw "Failed to extract bundled qqbot plugin archive."
-  }
-
-  $PackageRoot = Join-Path $ExtractDir "package"
-  if (-not (Test-Path (Join-Path $PackageRoot "package.json"))) {
-    throw "Extracted qqbot plugin package.json was not found."
-  }
-
-  New-Item -ItemType Directory -Force -Path $PluginRoot | Out-Null
-  Copy-Item -Recurse -Force (Join-Path $PackageRoot "*") $PluginRoot
-
-  Write-Host "Installing bundled qqbot plugin dependencies..."
-  $OriginalPath = $env:Path
-  try {
-    $env:Path = "$NodeRuntimeDir;$OriginalPath"
-    & $NpmCmd install --prefix $PluginRoot --no-audit --no-fund --omit=dev --legacy-peer-deps
-    if ($LASTEXITCODE -ne 0) {
-      throw "npm install exited with code $LASTEXITCODE"
-    }
-  }
-  finally {
-    $env:Path = $OriginalPath
-  }
-
-  Remove-UnsafePluginLocalLinks -PluginRoot $PluginRoot
-
-  $PluginEntry = Join-Path $PluginRoot 'index.ts'
-  if (-not (Test-Path $PluginEntry)) {
-    throw "Bundled qqbot plugin entry was not found at $PluginEntry."
-  }
-}
-
 function Install-OptionalChannelPluginDependencies {
-  $ExtensionsRoot = Join-Path $EngineDir "openclaw\node_modules\openclaw-cn\extensions"
+  $ExtensionsRoot = Join-Path $EngineDir "openclaw\node_modules\openclaw\dist\extensions"
   if (-not (Test-Path $ExtensionsRoot)) {
     return
   }
@@ -270,7 +198,11 @@ function Install-OptionalChannelPluginDependencies {
     $ManifestWasSanitized = Sanitize-OptionalPluginManifest -PluginRoot $PluginRoot
 
     Write-Host "Installing bundled plugin dependencies for $PluginDir..."
+    $OriginalNpmConfigCache = $env:NPM_CONFIG_CACHE
+    $OriginalLowerNpmConfigCache = $env:npm_config_cache
     try {
+      $env:NPM_CONFIG_CACHE = $NpmCacheDir
+      $env:npm_config_cache = $NpmCacheDir
       & $NpmCmd install --prefix $PluginRoot --no-audit --no-fund --omit=dev
       if ($LASTEXITCODE -ne 0) {
         throw "npm install exited with code $LASTEXITCODE"
@@ -286,6 +218,10 @@ function Install-OptionalChannelPluginDependencies {
         Write-Warning "Skipping optional plugin dependency install for $PluginDir due to npm install failure."
       }
       Remove-DirectoryIfExists $PluginNodeModules
+    }
+    finally {
+      $env:NPM_CONFIG_CACHE = $OriginalNpmConfigCache
+      $env:npm_config_cache = $OriginalLowerNpmConfigCache
     }
   }
 }
@@ -327,20 +263,6 @@ function Test-ExistingNodeRuntime {
   return $ExistingVersion -eq $NodeVersion
 }
 
-function Test-ExistingOllamaRuntime {
-  param([string]$RuntimeDir)
-
-  $OllamaExePath = Join-Path $RuntimeDir "ollama.exe"
-  $OllamaVersionPath = Join-Path $OllamaRootDir "VERSION"
-
-  if (-not ((Test-Path $OllamaExePath) -and (Test-Path $OllamaVersionPath))) {
-    return $false
-  }
-
-  $ExistingVersion = (Get-Content -Path $OllamaVersionPath -Raw).Trim()
-  return $ExistingVersion -eq $OllamaVersion
-}
-
 try {
   Stop-BundledWhereClawProcesses
   New-Item -ItemType Directory -Force -Path $TempDir | Out-Null
@@ -348,6 +270,7 @@ try {
   New-Item -ItemType Directory -Force -Path (Join-Path $EngineDir "openclaw") | Out-Null
   New-Item -ItemType Directory -Force -Path (Join-Path $EngineDir "templates") | Out-Null
   New-Item -ItemType Directory -Force -Path $OllamaRootDir | Out-Null
+  New-Item -ItemType Directory -Force -Path $NpmCacheDir | Out-Null
 
   $ArchiveName = Get-NodeArchiveName
   $ArchivePath = Join-Path $TempDir $ArchiveName
@@ -387,37 +310,44 @@ try {
   $OllamaPlatformDir = Get-OllamaPlatformDir
   $OllamaRuntimeDir = Join-Path $OllamaRootDir $OllamaPlatformDir
 
-  if (Test-ExistingOllamaRuntime -RuntimeDir $OllamaRuntimeDir) {
-    Write-Host "Reusing bundled Ollama runtime $OllamaVersion from $OllamaRuntimeDir"
-  }
-  else {
-    Write-Host "Downloading Ollama $OllamaVersion ($OllamaArchiveName)..."
-    Download-File -Uri "https://github.com/ollama/ollama/releases/download/v$OllamaVersion/$OllamaArchiveName" -OutFile $OllamaArchivePath -Label "Ollama $OllamaVersion"
-    Expand-Archive -Path $OllamaArchivePath -DestinationPath $OllamaExtractDir -Force
+  Write-Host "Downloading latest Ollama ($OllamaArchiveName)..."
+  Download-File -Uri "https://github.com/ollama/ollama/releases/latest/download/$OllamaArchiveName" -OutFile $OllamaArchivePath -Label "latest Ollama"
+  Expand-Archive -Path $OllamaArchivePath -DestinationPath $OllamaExtractDir -Force
 
-    Remove-DirectoryIfExists $OllamaRuntimeDir
-    New-Item -ItemType Directory -Force -Path $OllamaRuntimeDir | Out-Null
-    Copy-Item -Recurse -Force (Join-Path $OllamaExtractDir "*") $OllamaRuntimeDir
-    Set-Content -Path (Join-Path $OllamaRootDir "VERSION") -Value $OllamaVersion
-  }
+  Remove-DirectoryIfExists $OllamaRuntimeDir
+  New-Item -ItemType Directory -Force -Path $OllamaRuntimeDir | Out-Null
+  Copy-Item -Recurse -Force (Join-Path $OllamaExtractDir "*") $OllamaRuntimeDir
 
   $OllamaExe = Join-Path $OllamaRuntimeDir "ollama.exe"
   if (-not (Test-Path $OllamaExe)) {
     throw "Bundled Ollama runtime is missing ollama.exe."
   }
+  $OllamaVersionOutput = & $OllamaExe --version
+  $OllamaVersionMatch = [regex]::Match($OllamaVersionOutput, '([0-9]+\.[0-9]+\.[0-9]+)')
+  if (-not $OllamaVersionMatch.Success) {
+    throw "Unable to determine downloaded Ollama version from: $OllamaVersionOutput"
+  }
+  $ResolvedOllamaVersion = $OllamaVersionMatch.Groups[1].Value
+  Set-Content -Path (Join-Path $OllamaRootDir "VERSION") -Value $ResolvedOllamaVersion
 
   $InstallRoot = Join-Path $TempDir "openclaw-install"
   New-Item -ItemType Directory -Force -Path $InstallRoot | Out-Null
 
-  Write-Host "Installing OpenClaw package $OpenClawPackage..."
+  Write-Host "Installing OpenClaw package openclaw@latest..."
   $OriginalPath = $env:Path
+  $OriginalNpmConfigCache = $env:NPM_CONFIG_CACHE
+  $OriginalLowerNpmConfigCache = $env:npm_config_cache
   try {
     $env:Path = "$NodeRuntimeDir;$OriginalPath"
+    $env:NPM_CONFIG_CACHE = $NpmCacheDir
+    $env:npm_config_cache = $NpmCacheDir
     & $NpmCmd init -y --prefix $InstallRoot | Out-Null
-    & $NpmCmd install --prefix $InstallRoot --no-audit --no-fund --omit=dev $OpenClawPackage
+    & $NpmCmd install --prefix $InstallRoot --no-audit --no-fund --omit=dev openclaw@latest
   }
   finally {
     $env:Path = $OriginalPath
+    $env:NPM_CONFIG_CACHE = $OriginalNpmConfigCache
+    $env:npm_config_cache = $OriginalLowerNpmConfigCache
   }
 
   Remove-DirectoryIfExists (Join-Path $EngineDir "openclaw\node_modules")
@@ -429,8 +359,8 @@ try {
     Copy-Item -Force $PackageLock (Join-Path $EngineDir "openclaw\package-lock.json")
   }
 
-  $EntryPath = Join-Path $EngineDir "openclaw\node_modules\openclaw-cn\dist\entry.js"
-  $UiPath = Join-Path $EngineDir "openclaw\node_modules\openclaw-cn\dist\control-ui\index.html"
+  $EntryPath = Join-Path $EngineDir "openclaw\node_modules\openclaw\openclaw.mjs"
+  $UiPath = Join-Path $EngineDir "openclaw\node_modules\openclaw\dist\control-ui\index.html"
   $RuntimeUiDir = Join-Path $NodeRuntimeDir "control-ui"
   $RuntimeUiIndex = Join-Path $RuntimeUiDir "index.html"
 
@@ -443,10 +373,9 @@ try {
   }
 
   Remove-DirectoryIfExists $RuntimeUiDir
-  Copy-Item -Recurse -Force (Join-Path $EngineDir "openclaw\node_modules\openclaw-cn\dist\control-ui") $RuntimeUiDir
+  Copy-Item -Recurse -Force (Join-Path $EngineDir "openclaw\node_modules\openclaw\dist\control-ui") $RuntimeUiDir
 
   Install-OptionalChannelPluginDependencies
-  Build-BundledQqbotPlugin
 
   $TemplatePath = Join-Path $EngineDir "templates\openclaw.json"
   if (-not (Test-Path $TemplatePath)) {
@@ -456,11 +385,11 @@ try {
   Write-Host ""
   Write-Host "Prepared whereclaw-engine successfully."
   Write-Host "Node version:      $NodeVersion"
-  Write-Host "OpenClaw package:  $OpenClawPackage"
+  Write-Host "OpenClaw package:  openclaw@latest"
   Write-Host "Node runtime:      $NodeRuntimeDir"
   Write-Host "Node binary:       $NodeExe"
   Write-Host "NPM binary:        $NpmCmd"
-  Write-Host "Ollama version:    $OllamaVersion"
+  Write-Host "Ollama version:    $ResolvedOllamaVersion"
   Write-Host "Ollama runtime:    $OllamaRuntimeDir"
   Write-Host "Ollama binary:     $OllamaExe"
   Write-Host "OpenClaw entry:    $EntryPath"

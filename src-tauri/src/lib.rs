@@ -24,9 +24,8 @@ use sysinfo::{System, SystemExt};
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{path::BaseDirectory, AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::{path::BaseDirectory, AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 use url::Url;
-use zip::ZipArchive;
 
 #[cfg(not(target_os = "windows"))]
 use portable_pty::{native_pty_system, PtySize};
@@ -48,8 +47,16 @@ const OLLAMA_LOG_FILE_NAME: &str = "ollama.log";
 const GATEWAY_LOG_FILE_NAME: &str = "gateway.console.log";
 const LAUNCHER_LOG_MAX_BYTES: u64 = 1_048_576;
 const LAUNCHER_LOG_KEEP_FILES: usize = 5;
-const SKILL_DOWNLOAD_URL_TEMPLATE: &str =
-    "https://skillhub-1388575217.cos.ap-guangzhou.myqcloud.com/skills/{slug}.zip";
+const CLAWHUB_CN_MARKETPLACE_URL: &str = "https://cn.clawhub-mirror.com";
+const CLAWHUB_EN_MARKETPLACE_URL: &str = "https://clawhub.ai";
+const CLAWHUB_CN_HOST: &str = "cn.clawhub-mirror.com";
+const CLAWHUB_EN_HOST: &str = "clawhub.ai";
+const CLAWHUB_MARKETPLACE_WINDOW_LABEL: &str = "clawhub-marketplace";
+const CLAWHUB_INSTALL_REGISTRY: &str = "https://cn.clawhub-mirror.com";
+const CLAWHUB_CN_WINDOW_TITLE: &str = "ClawHub官方镜像站，WhereClaw一键安装";
+const CLAWHUB_EN_WINDOW_TITLE: &str = "ClawHub, install with WhereClaw";
+const CLAWHUB_INSTALL_COMMAND: &str = "install_current_clawhub_marketplace_skill";
+const CLAWHUB_STATUS_COMMAND: &str = "read_current_clawhub_marketplace_skill_installation_status";
 const REMOTE_SKILLS_MANIFEST_URL: &str = "https://r2.tolearn.cc/manifest.json";
 const REMOTE_SKILLS_DIR_NAME: &str = "remote-skills";
 const REMOTE_SKILLS_FILE_NAME: &str = "skills.json";
@@ -329,6 +336,13 @@ struct InstalledSkillEntry {
     has_references: bool,
     has_scripts: bool,
     enabled: bool,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClawhubSkillInstallationStatus {
+    skill_id: String,
+    installed: bool,
 }
 
 #[derive(Clone, Deserialize)]
@@ -1138,6 +1152,472 @@ fn open_control_ui_in_browser(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn open_clawhub_marketplace_window(app: AppHandle, language: Option<String>) -> Result<(), String> {
+    let language = normalize_launcher_language(language.as_deref().unwrap_or("en"))?;
+    let marketplace_url = clawhub_marketplace_url_for_language(language);
+    let window_title = clawhub_marketplace_title_for_language(language);
+    let url = Url::parse(marketplace_url)
+        .map_err(|error| format!("failed to parse ClawHub marketplace url: {error}"))?;
+
+    if let Some(window) = app.get_webview_window(CLAWHUB_MARKETPLACE_WINDOW_LABEL) {
+        let _ = window.set_title(window_title);
+        window
+            .navigate(url)
+            .map_err(|error| format!("failed to navigate ClawHub marketplace window: {error}"))?;
+        window
+            .set_focus()
+            .map_err(|error| format!("failed to focus ClawHub marketplace window: {error}"))?;
+        return Ok(());
+    }
+
+    WebviewWindowBuilder::new(
+        &app,
+        CLAWHUB_MARKETPLACE_WINDOW_LABEL,
+        WebviewUrl::External(url),
+    )
+    .title(window_title)
+    .inner_size(1180.0, 820.0)
+    .resizable(true)
+    .focused(true)
+    .initialization_script(clawhub_marketplace_initialization_script())
+    .build()
+    .map_err(|error| format!("failed to create ClawHub marketplace window: {error}"))?;
+
+    Ok(())
+}
+
+fn clawhub_marketplace_url_for_language(language: &str) -> &'static str {
+    if language == "zh-CN" {
+        CLAWHUB_CN_MARKETPLACE_URL
+    } else {
+        CLAWHUB_EN_MARKETPLACE_URL
+    }
+}
+
+fn clawhub_marketplace_title_for_language(language: &str) -> &'static str {
+    if language == "zh-CN" {
+        CLAWHUB_CN_WINDOW_TITLE
+    } else {
+        CLAWHUB_EN_WINDOW_TITLE
+    }
+}
+
+fn clawhub_marketplace_initialization_script() -> String {
+    format!(
+        r##"
+(() => {{
+  if (window.__WHERECLAW_CLAWHUB_INSTALLER__) return;
+  window.__WHERECLAW_CLAWHUB_INSTALLER__ = true;
+
+  const INSTALL_COMMAND = {install_command};
+  const STATUS_COMMAND = {status_command};
+  const CN_HOST = "cn.clawhub-mirror.com";
+  const EN_HOST = "clawhub.ai";
+  const ALLOWED_HOSTS = [CN_HOST, EN_HOST];
+  const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+  function isCnMarketplace() {{
+    try {{
+      return new URL(window.location.href).hostname === CN_HOST;
+    }} catch (_) {{
+      return true;
+    }}
+  }}
+
+  function labels() {{
+    if (isCnMarketplace()) {{
+      return {{
+        title: "ClawHub官方镜像站，WhereClaw一键安装",
+        install: "一键安装",
+        tooltip: "使用 WhereClaw 安装当前技能",
+        detailRequired: "请先打开具体技能详情页。",
+        apiUnavailable: "当前页面无法调用 WhereClaw 安装接口。",
+        confirmTitle: "确认安装",
+        continueTitle: "继续安装",
+        reinstall: "重新安装/更新",
+        continueInstall: "继续安装",
+        cancel: "取消",
+        confirm: "确认",
+        installing: (skillId) => `正在安装 ${{skillId}}...`,
+        success: (skillId) => `技能 ${{skillId}} 安装成功。`,
+        failed: (message) => `安装失败：${{message}}`,
+        installedConfirm: (skillId) => `技能 ${{skillId}} 已安装，是否重新安装/更新？`,
+        unknownConfirm: (skillId) => `无法确认 ${{skillId}} 是否已安装，是否继续安装？`,
+      }};
+    }}
+    return {{
+      title: "ClawHub, install with WhereClaw",
+      install: "Install with WhereClaw",
+      tooltip: "Install this skill with WhereClaw",
+      detailRequired: "Open a skill detail page first.",
+      apiUnavailable: "This page cannot call the WhereClaw installer.",
+      confirmTitle: "Confirm install",
+      continueTitle: "Continue install",
+      reinstall: "Reinstall/Update",
+      continueInstall: "Continue",
+      cancel: "Cancel",
+      confirm: "Confirm",
+      installing: (skillId) => `Installing ${{skillId}}...`,
+      success: (skillId) => `Skill ${{skillId}} installed successfully.`,
+      failed: (message) => `Install failed: ${{message}}`,
+      installedConfirm: (skillId) => `Skill ${{skillId}} is already installed. Reinstall or update it?`,
+      unknownConfirm: (skillId) => `Unable to confirm whether ${{skillId}} is installed. Continue installing?`,
+    }};
+  }}
+
+  function getSkillId() {{
+    try {{
+      const url = new URL(window.location.href);
+      if (!ALLOWED_HOSTS.includes(url.hostname)) return null;
+      const segments = url.pathname.split("/").map((segment) => segment.trim()).filter(Boolean);
+      const lastSegment = segments[segments.length - 1] || "";
+      return ID_PATTERN.test(lastSegment) ? lastSegment : null;
+    }} catch (_) {{
+      return null;
+    }}
+  }}
+
+  function setStatus(message, tone = "neutral") {{
+    let status = document.querySelector("[data-whereclaw-install-status]");
+    if (!status) {{
+      status = document.createElement("div");
+      status.setAttribute("data-whereclaw-install-status", "true");
+      status.style.position = "fixed";
+      status.style.left = "20px";
+      status.style.bottom = "20px";
+      status.style.zIndex = "2147483647";
+      status.style.maxWidth = "360px";
+      status.style.borderRadius = "8px";
+      status.style.padding = "10px 12px";
+      status.style.fontSize = "13px";
+      status.style.lineHeight = "18px";
+      status.style.boxShadow = "0 12px 32px rgba(15,23,42,0.18)";
+      document.documentElement.appendChild(status);
+    }}
+    status.textContent = message;
+    status.style.background = tone === "error" ? "#FEF2F2" : tone === "success" ? "#ECFDF5" : "#FFFFFF";
+    status.style.color = tone === "error" ? "#B91C1C" : tone === "success" ? "#047857" : "#334155";
+    status.style.border = tone === "error" ? "1px solid #FECACA" : tone === "success" ? "1px solid #A7F3D0" : "1px solid #E2E8F0";
+  }}
+
+  function showConfirmDialog(message, options = {{}}) {{
+    return new Promise((resolve) => {{
+      const text = labels();
+      const existing = document.querySelector("[data-whereclaw-confirm-overlay]");
+      if (existing) existing.remove();
+
+      const overlay = document.createElement("div");
+      overlay.setAttribute("data-whereclaw-confirm-overlay", "true");
+      Object.assign(overlay.style, {{
+        position: "fixed",
+        inset: "0",
+        zIndex: "2147483647",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: "20px",
+        background: "rgba(15, 23, 42, 0.42)",
+      }});
+
+      const dialog = document.createElement("div");
+      dialog.setAttribute("role", "dialog");
+      dialog.setAttribute("aria-modal", "true");
+      Object.assign(dialog.style, {{
+        width: "min(420px, 100%)",
+        boxSizing: "border-box",
+        borderRadius: "8px",
+        background: "#FFFFFF",
+        color: "#111827",
+        boxShadow: "0 20px 60px rgba(15, 23, 42, 0.28)",
+        padding: "20px",
+        fontFamily: "system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif",
+      }});
+
+      const title = document.createElement("div");
+      title.textContent = options.title || text.confirmTitle;
+      Object.assign(title.style, {{
+        fontSize: "16px",
+        fontWeight: "700",
+        lineHeight: "22px",
+        marginBottom: "8px",
+      }});
+
+      const body = document.createElement("div");
+      body.textContent = message;
+      Object.assign(body.style, {{
+        fontSize: "14px",
+        lineHeight: "21px",
+        color: "#374151",
+        marginBottom: "18px",
+      }});
+
+      const actions = document.createElement("div");
+      Object.assign(actions.style, {{
+        display: "flex",
+        justifyContent: "flex-end",
+        gap: "10px",
+      }});
+
+      const cancelButton = document.createElement("button");
+      cancelButton.type = "button";
+      cancelButton.textContent = options.cancelText || text.cancel;
+      Object.assign(cancelButton.style, {{
+        border: "1px solid #D1D5DB",
+        borderRadius: "8px",
+        background: "#FFFFFF",
+        color: "#374151",
+        padding: "8px 14px",
+        fontSize: "14px",
+        cursor: "pointer",
+      }});
+
+      const confirmButton = document.createElement("button");
+      confirmButton.type = "button";
+      confirmButton.textContent = options.confirmText || text.confirm;
+      Object.assign(confirmButton.style, {{
+        border: "1px solid #111827",
+        borderRadius: "8px",
+        background: "#111827",
+        color: "#FFFFFF",
+        padding: "8px 14px",
+        fontSize: "14px",
+        cursor: "pointer",
+      }});
+
+      let settled = false;
+      const finish = (value) => {{
+        if (settled) return;
+        settled = true;
+        document.removeEventListener("keydown", onKeyDown, true);
+        overlay.remove();
+        resolve(value);
+      }};
+
+      const onKeyDown = (event) => {{
+        if (event.key === "Escape") {{
+          event.preventDefault();
+          finish(false);
+        }}
+      }};
+
+      overlay.addEventListener("click", (event) => {{
+        if (event.target === overlay) finish(false);
+      }});
+      cancelButton.addEventListener("click", () => finish(false));
+      confirmButton.addEventListener("click", () => finish(true));
+
+      actions.appendChild(cancelButton);
+      actions.appendChild(confirmButton);
+      dialog.appendChild(title);
+      dialog.appendChild(body);
+      dialog.appendChild(actions);
+      overlay.appendChild(dialog);
+      document.documentElement.appendChild(overlay);
+      document.addEventListener("keydown", onKeyDown, true);
+      confirmButton.focus();
+    }});
+  }}
+
+  async function installCurrentSkill(button) {{
+    const text = labels();
+    const skillId = getSkillId();
+    if (!skillId) {{
+      setStatus(text.detailRequired, "error");
+      return;
+    }}
+    if (!window.__TAURI_INTERNALS__ || typeof window.__TAURI_INTERNALS__.invoke !== "function") {{
+      setStatus(text.apiUnavailable, "error");
+      return;
+    }}
+
+    let installForce = false;
+    try {{
+      const status = await window.__TAURI_INTERNALS__.invoke(STATUS_COMMAND);
+      if (status && status.installed) {{
+        const confirmed = await showConfirmDialog(text.installedConfirm(status.skillId || skillId), {{
+          confirmText: text.reinstall,
+        }});
+        if (!confirmed) return;
+        installForce = true;
+      }}
+    }} catch (_) {{
+      const confirmed = await showConfirmDialog(text.unknownConfirm(skillId), {{
+        title: text.continueTitle,
+        confirmText: text.continueInstall,
+      }});
+      if (!confirmed) return;
+    }}
+
+    const originalText = button && button.textContent;
+    if (button) {{
+      button.disabled = true;
+      button.textContent = isCnMarketplace() ? "安装中..." : "Installing...";
+    }}
+    setStatus(text.installing(skillId));
+
+    try {{
+      const installedSkillId = await window.__TAURI_INTERNALS__.invoke(INSTALL_COMMAND, {{
+        force: installForce,
+      }});
+      setStatus(text.success(installedSkillId || skillId), "success");
+      if (button) button.textContent = isCnMarketplace() ? "安装成功" : "Installed";
+    }} catch (error) {{
+      const message = typeof error === "string" ? error : error && error.message ? error.message : String(error);
+      if (/Already installed/i.test(message) || /use --force/i.test(message)) {{
+        const confirmed = await showConfirmDialog(text.installedConfirm(skillId), {{
+          confirmText: text.reinstall,
+        }});
+        if (confirmed) {{
+          try {{
+            const installedSkillId = await window.__TAURI_INTERNALS__.invoke(INSTALL_COMMAND, {{
+              force: true,
+            }});
+            setStatus(text.success(installedSkillId || skillId), "success");
+            if (button) button.textContent = isCnMarketplace() ? "安装成功" : "Installed";
+            return;
+          }} catch (retryError) {{
+            const retryMessage = typeof retryError === "string" ? retryError : retryError && retryError.message ? retryError.message : String(retryError);
+            setStatus(text.failed(retryMessage), "error");
+            if (button) button.textContent = originalText || text.install;
+            return;
+          }}
+        }}
+      }}
+      setStatus(text.failed(message), "error");
+      if (button) button.textContent = originalText || text.install;
+    }} finally {{
+      if (button) button.disabled = false;
+    }}
+  }}
+
+  function styleInstallButton(button) {{
+    const text = labels();
+    button.textContent = text.install;
+    button.setAttribute("data-whereclaw-install-button", "true");
+    button.setAttribute("title", text.tooltip);
+    if (button.style) {{
+      button.style.cursor = "pointer";
+      button.style.borderRadius = "8px";
+    }}
+  }}
+
+  function isDownloadZipButton(element) {{
+    const text = (element.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
+    const aria = (element.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim().toLowerCase();
+    const href = (element.getAttribute("href") || "").toLowerCase();
+    const combined = `${{text}} ${{aria}} ${{href}}`;
+    return combined.includes("zip") && (combined.includes("下载") || combined.includes("download"));
+  }}
+
+  function patchDownloadZipButtons() {{
+    const candidates = document.querySelectorAll("button, a, [role='button']");
+    candidates.forEach((candidate) => {{
+      if (!(candidate instanceof HTMLElement)) return;
+      if (candidate.getAttribute("data-whereclaw-install-button") === "true") return;
+      if (!isDownloadZipButton(candidate)) return;
+      styleInstallButton(candidate);
+      candidate.addEventListener("click", (event) => {{
+        event.preventDefault();
+        event.stopPropagation();
+        installCurrentSkill(candidate);
+      }}, true);
+    }});
+  }}
+
+  function syncInstallerUi() {{
+    patchDownloadZipButtons();
+  }}
+
+  const observer = new MutationObserver(syncInstallerUi);
+  const start = () => {{
+    syncInstallerUi();
+    observer.observe(document.documentElement, {{ childList: true, subtree: true }});
+  }};
+
+  if (document.readyState === "loading") {{
+    document.addEventListener("DOMContentLoaded", start, {{ once: true }});
+  }} else {{
+    start();
+  }}
+}})();
+"##,
+        install_command = serde_json::to_string(CLAWHUB_INSTALL_COMMAND)
+            .unwrap_or_else(|_| String::from("\"install_current_clawhub_marketplace_skill\"")),
+        status_command = serde_json::to_string(CLAWHUB_STATUS_COMMAND).unwrap_or_else(|_| {
+            String::from("\"read_current_clawhub_marketplace_skill_installation_status\"")
+        }),
+    )
+}
+
+#[tauri::command]
+async fn read_current_clawhub_marketplace_skill_installation_status(
+    app: AppHandle,
+) -> Result<ClawhubSkillInstallationStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let skill_id = current_clawhub_marketplace_skill_id(&app)?;
+        let openclaw_home = resolve_openclaw_home_dir(&app)?;
+        let installed = list_installed_skills_impl(&app)?
+            .iter()
+            .any(|entry| entry.id == skill_id || entry.skill_key == skill_id)
+            || clawhub_skill_install_dir_exists(&openclaw_home, &skill_id);
+
+        Ok(ClawhubSkillInstallationStatus {
+            skill_id,
+            installed,
+        })
+    })
+    .await
+    .map_err(|error| format!("failed to join ClawHub status task: {error}"))?
+}
+
+#[tauri::command]
+async fn install_current_clawhub_marketplace_skill(
+    app: AppHandle,
+    force: Option<bool>,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let window = app
+            .get_webview_window(CLAWHUB_MARKETPLACE_WINDOW_LABEL)
+            .ok_or_else(|| String::from("open the ClawHub marketplace before installing"))?;
+        let url = window
+            .url()
+            .map_err(|error| format!("failed to read ClawHub marketplace url: {error}"))?;
+        let skill_id = clawhub_skill_id_from_url(url.as_str())?;
+        let registry = clawhub_install_registry_from_url(url.as_str())?;
+        install_clawhub_skill_impl(&app, &skill_id, force.unwrap_or(false), registry)?;
+        let _ = app.emit("clawhub-skill-installed", skill_id.clone());
+        Ok(skill_id)
+    })
+    .await
+    .map_err(|error| format!("failed to join ClawHub install task: {error}"))?
+}
+
+fn current_clawhub_marketplace_skill_id(app: &AppHandle) -> Result<String, String> {
+    let window = app
+        .get_webview_window(CLAWHUB_MARKETPLACE_WINDOW_LABEL)
+        .ok_or_else(|| String::from("open the ClawHub marketplace before installing"))?;
+    let url = window
+        .url()
+        .map_err(|error| format!("failed to read ClawHub marketplace url: {error}"))?;
+    clawhub_skill_id_from_url(url.as_str())
+}
+
+fn clawhub_skill_install_dir_exists(openclaw_home: &Path, skill_id: &str) -> bool {
+    [
+        openclaw_home.join("skills").join(skill_id),
+        openclaw_home
+            .join(".openclaw")
+            .join("workspace")
+            .join("skills")
+            .join(skill_id),
+    ]
+    .iter()
+    .any(|path| {
+        path.join("SKILL.md").exists() || path.join(".clawhub").join("origin.json").exists()
+    })
+}
+
+#[tauri::command]
 fn open_external_url(url: String) -> Result<(), String> {
     let parsed = Url::parse(&url).map_err(|error| format!("invalid url: {error}"))?;
     let scheme = parsed.scheme();
@@ -1206,6 +1686,16 @@ export OLLAMA_MODELS={models}
         host = shell_single_quote(OLLAMA_HOST),
         models = shell_single_quote(ollama_models_dir),
         binary = ollama_binary,
+    )
+}
+
+fn build_whereclaw_terminal_node_cli_wrapper_script(node_binary: &str, cli_script: &str) -> String {
+    format!(
+        "#!/bin/zsh
+\"{node}\" \"{cli}\" \"$@\"
+",
+        node = node_binary,
+        cli = cli_script,
     )
 }
 
@@ -1411,6 +1901,38 @@ fn open_whereclaw_terminal(app: AppHandle) -> Result<(), String> {
             .map_err(|error| {
                 format!("failed to mark WhereClaw terminal ollama wrapper executable: {error}")
             })?;
+
+        for (command_name, cli_relative_path) in [
+            ("npm", ["lib", "node_modules", "npm", "bin", "npm-cli.js"]),
+            ("npx", ["lib", "node_modules", "npm", "bin", "npx-cli.js"]),
+            (
+                "corepack",
+                ["lib", "node_modules", "corepack", "dist", "corepack.js"],
+            ),
+        ] {
+            let cli_script = cli_relative_path
+                .iter()
+                .fold(engine_dir.join("node-runtime"), |path, component| {
+                    path.join(component)
+                });
+            let wrapper_path = terminal_bin_dir.join(command_name);
+            let wrapper = build_whereclaw_terminal_node_cli_wrapper_script(
+                &node_binary.display().to_string(),
+                &cli_script.display().to_string(),
+            );
+            fs::write(&wrapper_path, wrapper).map_err(|error| {
+                format!("failed to write WhereClaw terminal {command_name} wrapper: {error}")
+            })?;
+            Command::new("chmod")
+                .arg("+x")
+                .arg(&wrapper_path)
+                .status()
+                .map_err(|error| {
+                    format!(
+                        "failed to mark WhereClaw terminal {command_name} wrapper executable: {error}"
+                    )
+                })?;
+        }
 
         let shell_home_dir = openclaw_home.join("tmp").join("whereclaw-zdotdir");
         fs::create_dir_all(&shell_home_dir)
@@ -2094,8 +2616,7 @@ async fn apply_initial_setup_config(
             let app_id = qq.app_id.trim();
             let app_secret = qq.app_secret.trim();
             if !app_id.is_empty() && !app_secret.is_empty() {
-                let qq_plugin_path = ensure_qq_plugin_ready(&app, &engine_dir)?;
-                apply_initial_qq_channel_config(root, app_id, app_secret, qq_plugin_path.as_deref())?;
+                apply_initial_qq_channel_config(root, app_id, app_secret, None)?;
             }
         }
 
@@ -2158,14 +2679,6 @@ async fn set_skill_enabled(app: AppHandle, skill_key: String, enabled: bool) -> 
     tauri::async_runtime::spawn_blocking(move || set_skill_enabled_impl(&app, &skill_key, enabled))
         .await
         .map_err(|error| format!("failed to join set-skill-enabled task: {error}"))?
-}
-
-#[tauri::command]
-async fn install_skill_from_catalog(app: AppHandle, slug: String) -> Result<(), String> {
-    let app = app.clone();
-    tauri::async_runtime::spawn_blocking(move || install_skill_from_catalog_impl(&app, &slug))
-        .await
-        .map_err(|error| format!("failed to join install-skill task: {error}"))?
 }
 
 #[tauri::command]
@@ -3671,28 +4184,16 @@ fn resolve_openclaw_entry(engine_dir: &Path) -> Result<PathBuf, String> {
     let bundled_entry = engine_dir
         .join("openclaw")
         .join("node_modules")
-        .join("openclaw-cn")
-        .join("dist")
-        .join("entry.js");
+        .join("openclaw")
+        .join("openclaw.mjs");
 
     if bundled_entry.exists() {
         return Ok(bundled_entry);
     }
 
-    let legacy_entry = engine_dir
-        .join("openclaw")
-        .join("node_modules")
-        .join("openclaw")
-        .join("openclaw.mjs");
-
-    if legacy_entry.exists() {
-        return Ok(legacy_entry);
-    }
-
     Err(format!(
-        "bundled OpenClaw entry script not found: {} or {}",
-        bundled_entry.display(),
-        legacy_entry.display()
+        "bundled OpenClaw entry script not found: {}",
+        bundled_entry.display()
     ))
 }
 
@@ -4606,15 +5107,22 @@ fn list_installed_skills_impl(app: &AppHandle) -> Result<Vec<InstalledSkillEntry
         .join(".openclaw")
         .join("workspace")
         .join("skills");
+    let openclaw_home_skills_dir = openclaw_home.join("skills");
     let managed_skills_dir = openclaw_home.join(".openclaw").join("skills");
     let bundled_skills_dir = engine_dir
         .join("openclaw")
         .join("node_modules")
-        .join("openclaw-cn")
+        .join("openclaw")
         .join("skills");
 
     let mut entries = Vec::new();
     collect_skill_entries(&workspace_skills_dir, "workspace", &config, &mut entries)?;
+    collect_skill_entries(
+        &openclaw_home_skills_dir,
+        "workspace",
+        &config,
+        &mut entries,
+    )?;
     collect_skill_entries(&managed_skills_dir, "managed", &config, &mut entries)?;
     collect_skill_entries(&bundled_skills_dir, "bundled", &config, &mut entries)?;
 
@@ -4801,184 +5309,180 @@ fn set_skill_enabled_impl(app: &AppHandle, skill_key: &str, enabled: bool) -> Re
     write_openclaw_config(&openclaw_home, &config)
 }
 
-fn install_skill_from_catalog_impl(app: &AppHandle, slug: &str) -> Result<(), String> {
-    let normalized_slug = slug.trim();
-    if normalized_slug.is_empty() {
-        return Err(String::from("skill slug cannot be empty"));
-    }
-    let _ = append_launcher_log(
-        app,
-        "INFO",
-        &format!("install_skill_from_catalog started slug={normalized_slug}"),
-    );
-
-    let openclaw_home = resolve_openclaw_home_dir(app)?;
-    let workspace_skills_dir = openclaw_home
-        .join(".openclaw")
-        .join("workspace")
-        .join("skills");
-    fs::create_dir_all(&workspace_skills_dir).map_err(|error| {
-        format!(
-            "failed to create workspace skills directory {}: {error}",
-            workspace_skills_dir.display()
-        )
-    })?;
-
-    let download_url = SKILL_DOWNLOAD_URL_TEMPLATE.replace("{slug}", normalized_slug);
-    let client = Client::builder()
-        .build()
-        .map_err(|error| format!("failed to initialize download client: {error}"))?;
-    let response = client
-        .get(&download_url)
-        .send()
-        .map_err(|error| format!("failed to download skill archive: {error}"))?;
-
-    if !response.status().is_success() {
-        return Err(format!(
-            "failed to download skill archive: HTTP {}",
-            response.status()
+fn clawhub_skill_id_from_url(url: &str) -> Result<String, String> {
+    let parsed = Url::parse(url).map_err(|error| format!("invalid ClawHub url: {error}"))?;
+    let host = parsed.host_str().unwrap_or_default();
+    if !clawhub_host_is_supported(host) {
+        return Err(String::from(
+            "current page is not a supported ClawHub marketplace",
         ));
     }
 
-    let archive_bytes = response
-        .bytes()
-        .map_err(|error| format!("failed to read skill archive response: {error}"))?;
+    let Some(last_segment) = parsed
+        .path_segments()
+        .and_then(|segments| segments.filter(|segment| !segment.trim().is_empty()).last())
+    else {
+        return Err(String::from("open a skill detail page before installing"));
+    };
 
-    extract_skill_archive(
-        archive_bytes.as_ref(),
-        &workspace_skills_dir,
-        normalized_slug,
-    )?;
-    let _ = append_launcher_log(
-        app,
-        "INFO",
-        &format!("install_skill_from_catalog succeeded slug={normalized_slug}"),
-    );
-    Ok(())
+    validate_clawhub_skill_id(last_segment)
 }
 
-fn extract_skill_archive(
-    archive_bytes: &[u8],
-    workspace_skills_dir: &Path,
-    slug: &str,
+fn clawhub_host_is_supported(host: &str) -> bool {
+    matches!(host, CLAWHUB_CN_HOST | CLAWHUB_EN_HOST)
+}
+
+fn clawhub_install_registry_from_url(url: &str) -> Result<Option<&'static str>, String> {
+    let parsed = Url::parse(url).map_err(|error| format!("invalid ClawHub url: {error}"))?;
+    match parsed.host_str().unwrap_or_default() {
+        CLAWHUB_CN_HOST => Ok(Some(CLAWHUB_INSTALL_REGISTRY)),
+        CLAWHUB_EN_HOST => Ok(None),
+        _ => Err(String::from(
+            "current page is not a supported ClawHub marketplace",
+        )),
+    }
+}
+
+fn validate_clawhub_skill_id(skill_id: &str) -> Result<String, String> {
+    let normalized = skill_id.trim();
+    if normalized.is_empty() {
+        return Err(String::from("skill id cannot be empty"));
+    }
+    if normalized.starts_with('.') {
+        return Err(String::from("skill id cannot start with `.`"));
+    }
+    if normalized
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    {
+        return Ok(String::from(normalized));
+    }
+
+    Err(String::from(
+        "skill id may only contain letters, numbers, hyphens, underscores, and dots",
+    ))
+}
+
+fn build_clawhub_install_args(
+    skill_id: &str,
+    force: bool,
+    registry: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let normalized_skill_id = validate_clawhub_skill_id(skill_id)?;
+    let mut args = vec![
+        String::from("clawhub@latest"),
+        String::from("install"),
+        normalized_skill_id,
+    ];
+    if let Some(registry) = registry {
+        args.push(format!("--registry={registry}"));
+    }
+    if force {
+        args.push(String::from("--force"));
+    }
+    Ok(args)
+}
+
+fn install_clawhub_skill_impl(
+    app: &AppHandle,
+    skill_id: &str,
+    force: bool,
+    registry: Option<&str>,
 ) -> Result<(), String> {
-    let cursor = std::io::Cursor::new(archive_bytes);
-    let mut archive =
-        ZipArchive::new(cursor).map_err(|error| format!("failed to open zip archive: {error}"))?;
-    let target_root = workspace_skills_dir.join(slug);
-    let shared_root = detect_shared_archive_root(&mut archive);
+    let args = build_clawhub_install_args(skill_id, force, registry)?;
+    let _ = append_launcher_log(
+        app,
+        "INFO",
+        &format!("install_clawhub_skill started skill_id={skill_id}"),
+    );
 
-    if target_root.exists() {
-        fs::remove_dir_all(&target_root).map_err(|error| {
-            format!(
-                "failed to replace existing skill directory {}: {error}",
-                target_root.display()
-            )
-        })?;
-    }
-    fs::create_dir_all(&target_root).map_err(|error| {
-        format!(
-            "failed to create skill target directory {}: {error}",
-            target_root.display()
-        )
-    })?;
+    run_npx_command(app, &args.iter().map(String::as_str).collect::<Vec<_>>())?;
 
-    for index in 0..archive.len() {
-        let mut entry = archive
-            .by_index(index)
-            .map_err(|error| format!("failed to inspect zip entry: {error}"))?;
-        let Some(entry_path) = entry.enclosed_name().map(PathBuf::from) else {
-            continue;
-        };
-
-        let relative_path = normalize_archive_entry_path(&entry_path, shared_root.as_deref());
-        if relative_path.as_os_str().is_empty() {
-            continue;
-        }
-
-        let output_path = target_root.join(&relative_path);
-        if entry.is_dir() {
-            fs::create_dir_all(&output_path).map_err(|error| {
-                format!(
-                    "failed to create extracted directory {}: {error}",
-                    output_path.display()
-                )
-            })?;
-            continue;
-        }
-
-        if let Some(parent) = output_path.parent() {
-            fs::create_dir_all(parent).map_err(|error| {
-                format!(
-                    "failed to create extracted parent directory {}: {error}",
-                    parent.display()
-                )
-            })?;
-        }
-
-        let mut output_file = fs::File::create(&output_path).map_err(|error| {
-            format!(
-                "failed to create extracted file {}: {error}",
-                output_path.display()
-            )
-        })?;
-        std::io::copy(&mut entry, &mut output_file).map_err(|error| {
-            format!(
-                "failed to write extracted file {}: {error}",
-                output_path.display()
-            )
-        })?;
-    }
-
-    let skill_file = target_root.join("SKILL.md");
-    if !skill_file.exists() {
-        return Err(format!(
-            "downloaded archive for `{slug}` does not contain a valid SKILL.md"
-        ));
-    }
-
+    let _ = append_launcher_log(
+        app,
+        "INFO",
+        &format!("install_clawhub_skill succeeded skill_id={skill_id}"),
+    );
     Ok(())
 }
 
-fn detect_shared_archive_root<R: Read + std::io::Seek>(
-    archive: &mut ZipArchive<R>,
-) -> Option<PathBuf> {
-    let mut shared_root = None::<PathBuf>;
-
-    for index in 0..archive.len() {
-        let Ok(entry) = archive.by_index(index) else {
-            return None;
-        };
-        let Some(path) = entry.enclosed_name() else {
-            continue;
-        };
-
-        let mut components = path.components();
-        let Some(first) = components.next() else {
-            continue;
-        };
-        let first_component = PathBuf::from(first.as_os_str());
-        if components.next().is_none() {
-            return None;
-        }
-
-        match &shared_root {
-            None => shared_root = Some(first_component),
-            Some(existing) if existing == &first_component => {}
-            Some(_) => return None,
-        }
+fn resolve_npx_entry(engine_dir: &Path) -> Result<PathBuf, String> {
+    let npx_entry = engine_dir
+        .join("node-runtime")
+        .join("lib")
+        .join("node_modules")
+        .join("npm")
+        .join("bin")
+        .join("npx-cli.js");
+    if !npx_entry.exists() {
+        return Err(format!(
+            "bundled npx entry not found: {}",
+            npx_entry.display()
+        ));
     }
 
-    shared_root
+    Ok(npx_entry)
 }
 
-fn normalize_archive_entry_path(path: &Path, shared_root: Option<&Path>) -> PathBuf {
-    if let Some(root) = shared_root {
-        if let Ok(stripped) = path.strip_prefix(root) {
-            return stripped.to_path_buf();
-        }
+fn run_npx_command(app: &AppHandle, args: &[&str]) -> Result<String, String> {
+    let launcher_preferences = read_launcher_preferences_impl(app)?;
+    if !launcher_preferences.has_saved_preferences {
+        return Err(String::from(
+            "Launcher preferences are not configured yet. Choose a language and install directory first.",
+        ));
     }
-    path.to_path_buf()
+
+    let engine_dir = resolve_engine_dir(app)?;
+    let node_binary = resolve_node_binary(&engine_dir)?;
+    let runtime_bin_dir = resolve_runtime_bin_dir(&engine_dir)?;
+    let npx_entry = resolve_npx_entry(&engine_dir)?;
+    let openclaw_home = initialize_openclaw_home(app, &engine_dir)?;
+    let tmp_dir = initialize_openclaw_tmp_dir(&openclaw_home)?;
+    let npm_cache_dir = resolve_npm_cache_dir(&openclaw_home);
+    let npm_prefix_dir = resolve_npm_prefix_dir(&openclaw_home);
+    let corepack_home_dir = resolve_corepack_home_dir(&openclaw_home);
+    let node_binary_for_node = normalize_windows_path_for_node(&node_binary);
+    let runtime_bin_dir_for_node = normalize_windows_path_for_node(&runtime_bin_dir);
+    let npx_entry_for_node = normalize_windows_path_for_node(&npx_entry);
+
+    let mut command = Command::new(&node_binary_for_node);
+    command
+        .current_dir(&openclaw_home)
+        .arg(&npx_entry_for_node)
+        .args(args)
+        .env("OPENCLAW_HOME", &openclaw_home)
+        .env("OPENCLAW_STATE_DIR", &openclaw_home)
+        .env("OPENCLAW_CONFIG_PATH", openclaw_home.join("openclaw.json"))
+        .env("TMPDIR", &tmp_dir)
+        .env("NPM_CONFIG_CACHE", &npm_cache_dir)
+        .env("npm_config_cache", &npm_cache_dir)
+        .env("NPM_CONFIG_PREFIX", &npm_prefix_dir)
+        .env("npm_config_prefix", &npm_prefix_dir)
+        .env("COREPACK_HOME", &corepack_home_dir);
+    apply_registry_env(&mut command, &launcher_preferences.language);
+    prepend_path_env(&mut command, &runtime_bin_dir_for_node)?;
+
+    let output = hide_windows_console(&mut command)
+        .output()
+        .map_err(|error| format!("failed to run ClawHub install command: {error}"))?;
+
+    if output.status.success() {
+        return String::from_utf8(output.stdout)
+            .map_err(|error| format!("ClawHub install command emitted invalid UTF-8: {error}"));
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !stderr.is_empty() {
+        Err(stderr)
+    } else if !stdout.is_empty() {
+        Err(stdout)
+    } else {
+        Err(format!(
+            "ClawHub install command exited with status {}",
+            output.status
+        ))
+    }
 }
 
 fn remove_workspace_skill_impl(app: &AppHandle, slug: &str) -> Result<(), String> {
@@ -4988,19 +5492,21 @@ fn remove_workspace_skill_impl(app: &AppHandle, slug: &str) -> Result<(), String
     }
 
     let openclaw_home = resolve_openclaw_home_dir(app)?;
-    let skill_dir = openclaw_home
-        .join(".openclaw")
-        .join("workspace")
-        .join("skills")
-        .join(normalized_slug);
-
-    if !skill_dir.exists() {
+    let candidate_skill_dirs = [
+        openclaw_home
+            .join(".openclaw")
+            .join("workspace")
+            .join("skills")
+            .join(normalized_slug),
+        openclaw_home.join("skills").join(normalized_slug),
+    ];
+    let Some(skill_dir) = candidate_skill_dirs.iter().find(|path| path.exists()) else {
         return Err(format!(
             "workspace skill `{normalized_slug}` does not exist"
         ));
-    }
+    };
 
-    fs::remove_dir_all(&skill_dir).map_err(|error| {
+    fs::remove_dir_all(skill_dir).map_err(|error| {
         format!(
             "failed to remove workspace skill directory {}: {error}",
             skill_dir.display()
@@ -5295,122 +5801,11 @@ fn apply_initial_ollama_model_config(root: &mut Map<String, Value>, model: &str)
     }
 }
 
-fn resolve_bundled_qq_plugin_dir(engine_dir: &Path) -> PathBuf {
-    engine_dir
-        .join("openclaw")
-        .join("node_modules")
-        .join("openclaw-cn")
-        .join("extensions")
-        .join("qqbot")
-}
-
-fn resolve_installed_qq_plugin_dir(openclaw_home: &Path) -> PathBuf {
-    openclaw_home.join("extensions").join("qqbot")
-}
-
-fn qq_plugin_path_for_node(path: &Path) -> String {
-    normalize_windows_path_for_node(path).display().to_string()
-}
-
-fn qq_plugin_dir_has_runtime_entry(plugin_dir: &Path) -> bool {
-    if plugin_dir.join("dist").join("index.js").exists() {
-        return true;
-    }
-
-    let package_json = plugin_dir.join("package.json");
-    let Ok(package_text) = fs::read_to_string(package_json) else {
-        return false;
-    };
-    let Ok(package_value) = serde_json::from_str::<Value>(&package_text) else {
-        return false;
-    };
-
-    package_value
-        .get("openclaw")
-        .and_then(Value::as_object)
-        .and_then(|openclaw| openclaw.get("extensions"))
-        .and_then(Value::as_array)
-        .is_some_and(|extensions| {
-            extensions.iter().filter_map(Value::as_str).any(|entry| {
-                let trimmed = entry.trim();
-                !trimmed.is_empty() && plugin_dir.join(trimmed).exists()
-            })
-        })
-}
-
-fn ensure_generated_qq_plugin_wrapper(
-    openclaw_home: &Path,
-    engine_dir: &Path,
-) -> Result<Option<PathBuf>, String> {
-    let bundled_plugin_dir = resolve_bundled_qq_plugin_dir(engine_dir);
-    let bundled_manifest = bundled_plugin_dir.join("openclaw.plugin.json");
-    let bundled_channel_entry = bundled_plugin_dir.join("src").join("channel.ts");
-    if !bundled_manifest.exists() || !bundled_channel_entry.exists() {
-        return Ok(None);
-    }
-
-    let wrapper_dir = resolve_installed_qq_plugin_dir(openclaw_home);
-    fs::create_dir_all(&wrapper_dir)
-        .map_err(|error| format!("failed to create qqbot wrapper directory: {error}"))?;
-
-    fs::copy(&bundled_manifest, wrapper_dir.join("openclaw.plugin.json"))
-        .map_err(|error| format!("failed to copy qqbot manifest into wrapper dir: {error}"))?;
-
-    fs::write(
-        wrapper_dir.join("package.json"),
-        "{\n  \"name\": \"qqbot\",\n  \"type\": \"module\",\n  \"openclaw\": {\n    \"extensions\": [\"./index.ts\"]\n  }\n}\n",
-    )
-    .map_err(|error| format!("failed to write qqbot wrapper package.json: {error}"))?;
-
-    let import_path = serde_json::to_string(&qq_plugin_path_for_node(&bundled_channel_entry))
-        .map_err(|error| format!("failed to encode qqbot wrapper import path: {error}"))?;
-    let wrapper_source = format!(
-        "import {{ qqbotPlugin }} from {import_path};\n\nconst plugin = {{\n  id: \"qqbot\",\n  register(api) {{\n    api.registerChannel({{ plugin: qqbotPlugin }});\n  }},\n}};\n\nexport default plugin;\n"
-    );
-    fs::write(wrapper_dir.join("index.ts"), wrapper_source)
-        .map_err(|error| format!("failed to write qqbot wrapper entry: {error}"))?;
-
-    Ok(Some(wrapper_dir))
-}
-
-fn ensure_qq_plugin_runtime_path(
-    openclaw_home: &Path,
-    engine_dir: Option<&Path>,
-) -> Result<Option<String>, String> {
-    if let Some(engine_dir) = engine_dir {
-        let bundled_plugin_dir = resolve_bundled_qq_plugin_dir(engine_dir);
-        if qq_plugin_dir_has_runtime_entry(&bundled_plugin_dir) {
-            return Ok(Some(qq_plugin_path_for_node(&bundled_plugin_dir)));
-        }
-
-        let installed_plugin_dir = resolve_installed_qq_plugin_dir(openclaw_home);
-        if qq_plugin_dir_has_runtime_entry(&installed_plugin_dir) {
-            return Ok(Some(qq_plugin_path_for_node(&installed_plugin_dir)));
-        }
-
-        if let Some(wrapper_dir) = ensure_generated_qq_plugin_wrapper(openclaw_home, engine_dir)? {
-            return Ok(Some(qq_plugin_path_for_node(&wrapper_dir)));
-        }
-    }
-
-    let installed_plugin_dir = resolve_installed_qq_plugin_dir(openclaw_home);
-    if qq_plugin_dir_has_runtime_entry(&installed_plugin_dir) {
-        return Ok(Some(qq_plugin_path_for_node(&installed_plugin_dir)));
-    }
-
-    Ok(None)
-}
-
-fn ensure_qq_plugin_ready(app: &AppHandle, engine_dir: &Path) -> Result<Option<String>, String> {
-    let openclaw_home = resolve_openclaw_home_dir(app)?;
-    ensure_qq_plugin_runtime_path(&openclaw_home, Some(engine_dir))
-}
-
 fn apply_initial_qq_channel_config(
     root: &mut Map<String, Value>,
     app_id: &str,
     app_secret: &str,
-    qq_plugin_path: Option<&str>,
+    _qq_plugin_path: Option<&str>,
 ) -> Result<(), String> {
     let channels = root
         .entry(String::from("channels"))
@@ -5426,68 +5821,6 @@ fn apply_initial_qq_channel_config(
                 String::from("clientSecret"),
                 Value::String(String::from(app_secret)),
             );
-            qqbot_obj.insert(
-                String::from("dmPolicy"),
-                Value::String(String::from("pairing")),
-            );
-        }
-    }
-
-    let plugins = root
-        .entry(String::from("plugins"))
-        .or_insert_with(|| Value::Object(Map::new()));
-    let Some(plugins_obj) = plugins.as_object_mut() else {
-        return Ok(());
-    };
-
-    let entries = plugins_obj
-        .entry(String::from("entries"))
-        .or_insert_with(|| Value::Object(Map::new()));
-    if let Some(entries_obj) = entries.as_object_mut() {
-        let qqbot_entry = entries_obj
-            .entry(String::from("qqbot"))
-            .or_insert_with(|| Value::Object(Map::new()));
-        if let Some(qqbot_entry_obj) = qqbot_entry.as_object_mut() {
-            qqbot_entry_obj.insert(String::from("enabled"), Value::Bool(true));
-        }
-    }
-
-    if let Some(load) = plugins_obj
-        .entry(String::from("load"))
-        .or_insert_with(|| Value::Object(Map::new()))
-        .as_object_mut()
-    {
-        if let Some(paths) = load
-            .entry(String::from("paths"))
-            .or_insert_with(|| Value::Array(Vec::new()))
-            .as_array_mut()
-        {
-            let bundled_marker =
-                "/whereclaw-engine/openclaw/node_modules/openclaw-cn/extensions/qqbot";
-            let installed_marker = "/openclaw-home/extensions/qqbot";
-            let selected_path = qq_plugin_path.unwrap_or_default();
-
-            paths.retain(|entry| {
-                let Some(path) = entry.as_str() else {
-                    return true;
-                };
-                if path.contains(bundled_marker) && selected_path != path {
-                    return false;
-                }
-                if path.contains(installed_marker) && !selected_path.is_empty() {
-                    return false;
-                }
-                true
-            });
-
-            if let Some(path) = qq_plugin_path {
-                let exists = paths
-                    .iter()
-                    .any(|entry| entry.as_str().is_some_and(|value| value == path));
-                if !exists {
-                    paths.push(Value::String(String::from(path)));
-                }
-            }
         }
     }
 
@@ -5800,6 +6133,17 @@ fn sanitize_openclaw_config(openclaw_home: &Path, engine_dir: Option<&Path>) -> 
         }
     }
 
+    if let Some(qqbot) = root
+        .get_mut("channels")
+        .and_then(Value::as_object_mut)
+        .and_then(|channels| channels.get_mut("qqbot"))
+        .and_then(Value::as_object_mut)
+    {
+        if qqbot.remove("dmPolicy").is_some() {
+            changed = true;
+        }
+    }
+
     if repair_plugin_load_paths(root, openclaw_home, engine_dir)? {
         changed = true;
     }
@@ -5848,56 +6192,35 @@ fn generate_local_gateway_token(openclaw_home: &Path) -> String {
     format!("whereclaw-{:016x}", hasher.finish())
 }
 
-fn resolve_qq_plugin_path_for_config(
-    openclaw_home: &Path,
-    engine_dir: Option<&Path>,
-) -> Result<Option<String>, String> {
-    ensure_qq_plugin_runtime_path(openclaw_home, engine_dir)
-}
-
 fn repair_plugin_load_paths(
     root: &mut Map<String, Value>,
-    openclaw_home: &Path,
-    engine_dir: Option<&Path>,
+    _openclaw_home: &Path,
+    _engine_dir: Option<&Path>,
 ) -> Result<bool, String> {
-    let qq_enabled = root
-        .get("channels")
-        .and_then(Value::as_object)
-        .and_then(|channels| channels.get("qqbot"))
-        .and_then(Value::as_object)
-        .and_then(|qqbot| qqbot.get("enabled"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-        || root
-            .get("plugins")
-            .and_then(Value::as_object)
-            .and_then(|plugins| plugins.get("entries"))
-            .and_then(Value::as_object)
-            .and_then(|entries| entries.get("qqbot"))
-            .and_then(Value::as_object)
-            .and_then(|qqbot| qqbot.get("enabled"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-
-    let desired_qq_path = if qq_enabled {
-        resolve_qq_plugin_path_for_config(openclaw_home, engine_dir)?
-    } else {
-        None
-    };
-
     let Some(plugins_obj) = root.get_mut("plugins").and_then(Value::as_object_mut) else {
         return Ok(false);
     };
+    let mut changed = false;
+
+    if let Some(entries_obj) = plugins_obj
+        .get_mut("entries")
+        .and_then(Value::as_object_mut)
+    {
+        if entries_obj.remove("qqbot").is_some() {
+            changed = true;
+        }
+    }
+
     let Some(load_obj) = plugins_obj.get_mut("load").and_then(Value::as_object_mut) else {
-        return Ok(false);
+        return Ok(changed);
     };
     let Some(paths) = load_obj.get_mut("paths").and_then(Value::as_array_mut) else {
-        return Ok(false);
+        return Ok(changed);
     };
 
-    let bundled_marker = "/whereclaw-engine/openclaw/node_modules/openclaw-cn/extensions/qqbot";
+    let bundled_marker = "/whereclaw-engine/openclaw/node_modules/openclaw/dist/extensions/qqbot";
+    let legacy_bundled_marker = "/whereclaw-engine/openclaw/node_modules/openclaw/extensions/qqbot";
     let installed_marker = "/openclaw-home/extensions/qqbot";
-    let mut changed = false;
 
     paths.retain(|entry| {
         let Some(path) = entry.as_str() else {
@@ -5910,33 +6233,17 @@ fn repair_plugin_load_paths(
         }
 
         let is_qq_path = path.replace('\\', "/").contains(bundled_marker)
+            || path.replace('\\', "/").contains(legacy_bundled_marker)
             || path.replace('\\', "/").contains(installed_marker)
             || path.replace('\\', "/").ends_with("/extensions/qqbot");
 
         if is_qq_path {
-            if let Some(desired_path) = desired_qq_path.as_deref() {
-                if path != desired_path {
-                    changed = true;
-                    return false;
-                }
-            } else {
-                changed = true;
-                return false;
-            }
+            changed = true;
+            return false;
         }
 
         true
     });
-
-    if let Some(desired_path) = desired_qq_path {
-        let exists = paths
-            .iter()
-            .any(|entry| entry.as_str().is_some_and(|value| value == desired_path));
-        if !exists {
-            paths.push(Value::String(desired_path));
-            changed = true;
-        }
-    }
 
     Ok(changed)
 }
@@ -6199,7 +6506,9 @@ pub fn run() {
             list_openclaw_models,
             list_installed_skills,
             set_skill_enabled,
-            install_skill_from_catalog,
+            open_clawhub_marketplace_window,
+            read_current_clawhub_marketplace_skill_installation_status,
+            install_current_clawhub_marketplace_skill,
             remove_workspace_skill,
             set_openclaw_primary_model,
             save_local_model_selection,
@@ -6227,16 +6536,25 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, time::{SystemTime, UNIX_EPOCH}};
+    use std::{
+        env, fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
-    use serde_json::Value;
+    use serde_json::{Map, Value};
 
     use super::{
+        apply_initial_qq_channel_config, build_clawhub_install_args,
+        build_whereclaw_terminal_node_cli_wrapper_script,
         build_whereclaw_terminal_ollama_wrapper_script, build_whereclaw_terminal_shell_rc,
-        build_whereclaw_terminal_windows_script, is_remote_desktop_version_newer,
-        is_remote_version_newer, normalize_ollama_model_name_for_lookup,
-        repair_plugin_load_paths, resolve_qq_plugin_path_for_config, ensure_object, CachedSkillCatalogMetadata,
-        HEALTH_CHECK_ATTEMPTS, HEALTH_CHECK_DELAY_MS, OLLAMA_HOST,
+        build_whereclaw_terminal_windows_script, clawhub_marketplace_initialization_script,
+        clawhub_marketplace_title_for_language, clawhub_marketplace_url_for_language,
+        clawhub_skill_id_from_url, clawhub_skill_install_dir_exists, ensure_object,
+        is_remote_desktop_version_newer, is_remote_version_newer,
+        normalize_ollama_model_name_for_lookup, repair_plugin_load_paths, resolve_openclaw_entry,
+        CachedSkillCatalogMetadata, CLAWHUB_CN_MARKETPLACE_URL, CLAWHUB_CN_WINDOW_TITLE,
+        CLAWHUB_EN_MARKETPLACE_URL, CLAWHUB_EN_WINDOW_TITLE, CLAWHUB_INSTALL_REGISTRY,
+        CLAWHUB_STATUS_COMMAND, HEALTH_CHECK_ATTEMPTS, HEALTH_CHECK_DELAY_MS, OLLAMA_HOST,
     };
 
     #[test]
@@ -6265,6 +6583,123 @@ mod tests {
         assert!(!is_remote_desktop_version_newer(Some(""), "1.0.0"));
         assert!(!is_remote_desktop_version_newer(None, "1.0.0"));
         assert!(!is_remote_desktop_version_newer(Some("latest"), "1.0.0"));
+    }
+
+    #[test]
+    fn chooses_clawhub_marketplace_by_language() {
+        assert_eq!(
+            clawhub_marketplace_url_for_language("zh-CN"),
+            CLAWHUB_CN_MARKETPLACE_URL
+        );
+        assert_eq!(
+            clawhub_marketplace_title_for_language("zh-CN"),
+            CLAWHUB_CN_WINDOW_TITLE
+        );
+        assert_eq!(
+            clawhub_marketplace_url_for_language("en"),
+            CLAWHUB_EN_MARKETPLACE_URL
+        );
+        assert_eq!(
+            clawhub_marketplace_title_for_language("en"),
+            CLAWHUB_EN_WINDOW_TITLE
+        );
+    }
+
+    #[test]
+    fn extracts_clawhub_skill_id_from_detail_url() {
+        assert_eq!(
+            clawhub_skill_id_from_url("https://cn.clawhub-mirror.com/pskoett/self-improving-agent"),
+            Ok(String::from("self-improving-agent"))
+        );
+        assert_eq!(
+            clawhub_skill_id_from_url("https://cn.clawhub-mirror.com/sonoscli?tab=readme"),
+            Ok(String::from("sonoscli"))
+        );
+        assert_eq!(
+            clawhub_skill_id_from_url("https://clawhub.ai/pskoett/self-improving-agent"),
+            Ok(String::from("self-improving-agent"))
+        );
+    }
+
+    #[test]
+    fn rejects_clawhub_homepage_when_no_skill_id_is_present() {
+        assert!(clawhub_skill_id_from_url("https://cn.clawhub-mirror.com").is_err());
+        assert!(clawhub_skill_id_from_url("https://clawhub.ai").is_err());
+    }
+
+    #[test]
+    fn builds_clawhub_npx_install_arguments_for_cn_mirror() {
+        assert_eq!(
+            build_clawhub_install_args("sonoscli", false, Some(CLAWHUB_INSTALL_REGISTRY)),
+            Ok(vec![
+                String::from("clawhub@latest"),
+                String::from("install"),
+                String::from("sonoscli"),
+                format!("--registry={CLAWHUB_INSTALL_REGISTRY}"),
+            ])
+        );
+    }
+
+    #[test]
+    fn builds_clawhub_npx_install_arguments_for_official_site_without_registry() {
+        assert_eq!(
+            build_clawhub_install_args("sonoscli", false, None),
+            Ok(vec![
+                String::from("clawhub@latest"),
+                String::from("install"),
+                String::from("sonoscli"),
+            ])
+        );
+    }
+
+    #[test]
+    fn builds_clawhub_force_install_arguments_for_reinstall() {
+        let args = build_clawhub_install_args("sonoscli", true, None)
+            .expect("force install args should build");
+
+        assert!(args.contains(&String::from("--force")));
+    }
+
+    #[test]
+    fn clawhub_injection_replaces_zip_button_without_floating_fallback() {
+        let script = clawhub_marketplace_initialization_script();
+
+        assert!(script.contains("data-whereclaw-install-button"));
+        assert!(script.contains("isDownloadZipButton"));
+        assert!(script.contains("ClawHub官方镜像站，WhereClaw一键安装"));
+        assert!(script.contains("Install with WhereClaw"));
+        assert!(script.contains("clawhub.ai"));
+        assert!(!script.contains("document.title"));
+        assert!(!script.contains("setInterval"));
+        assert!(script.contains("已安装，是否重新安装/更新？"));
+        assert!(script.contains("installForce = true"));
+        assert!(script.contains("force: true"));
+        assert!(script.contains("Already installed"));
+        assert!(script.contains(CLAWHUB_STATUS_COMMAND));
+        assert!(script.contains("data-whereclaw-confirm-overlay"));
+        assert!(script.contains("showConfirmDialog"));
+        assert!(!script.contains("window.confirm"));
+        assert!(!script.contains("data-whereclaw-floating-install-button"));
+    }
+
+    #[test]
+    fn clawhub_skill_install_detection_checks_default_skills_dir() {
+        let unique = format!(
+            "whereclaw-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let root = env::temp_dir().join(&unique);
+        let skill_dir = root.join("skills").join("trello");
+        fs::create_dir_all(&skill_dir).expect("test skill dir should be created");
+        fs::write(skill_dir.join("SKILL.md"), "---\nname: trello\n---\n")
+            .expect("test skill file should be written");
+
+        assert!(clawhub_skill_install_dir_exists(&root, "trello"));
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -6317,6 +6752,18 @@ mod tests {
     }
 
     #[test]
+    fn whereclaw_terminal_npm_wrapper_targets_real_npm_cli() {
+        let wrapper = build_whereclaw_terminal_node_cli_wrapper_script(
+            "/engine/node-runtime/bin/node",
+            "/engine/node-runtime/lib/node_modules/npm/bin/npm-cli.js",
+        );
+
+        assert!(wrapper.contains(
+            "\"/engine/node-runtime/bin/node\" \"/engine/node-runtime/lib/node_modules/npm/bin/npm-cli.js\" \"$@\""
+        ));
+    }
+
+    #[test]
     fn whereclaw_terminal_windows_script_sets_ollama_env_and_hint() {
         let script = build_whereclaw_terminal_windows_script(
             "C:/openclaw/home",
@@ -6343,9 +6790,9 @@ mod tests {
     }
 
     #[test]
-    fn resolve_qq_plugin_path_prefers_runtime_ready_bundled_plugin_over_installed_wrapper() {
+    fn resolve_openclaw_entry_uses_official_openclaw_cli_bin() {
         let unique = format!(
-            "whereclaw-qqbot-bundled-test-{}-{}",
+            "whereclaw-openclaw-entry-test-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -6353,61 +6800,61 @@ mod tests {
                 .as_nanos()
         );
         let temp_root = std::env::temp_dir().join(unique);
-        let openclaw_home = temp_root.join("openclaw-home");
-        let engine_dir = temp_root.join("whereclaw-engine");
-        let bundled_plugin_dir = engine_dir
+        let entry_path = temp_root
             .join("openclaw")
             .join("node_modules")
-            .join("openclaw-cn")
-            .join("extensions")
-            .join("qqbot");
-        let installed_plugin_dir = openclaw_home.join("extensions").join("qqbot");
+            .join("openclaw")
+            .join("openclaw.mjs");
 
-        fs::create_dir_all(&bundled_plugin_dir).expect("should create bundled qqbot dir");
-        fs::write(
-            bundled_plugin_dir.join("package.json"),
-            r#"{
-  "name": "@sliverp/qqbot",
-  "openclaw": {
-    "extensions": ["./index.ts"]
-  }
-}
-"#,
-        )
-        .expect("should write bundled qqbot package.json");
-        fs::write(bundled_plugin_dir.join("index.ts"), "export default {};
-")
-            .expect("should write bundled qqbot runtime entry");
+        fs::create_dir_all(entry_path.parent().expect("entry should have parent"))
+            .expect("should create official openclaw package dir");
+        fs::write(&entry_path, "export {};\n").expect("should write official entry");
 
-        fs::create_dir_all(&installed_plugin_dir).expect("should create installed qqbot dir");
-        fs::write(
-            installed_plugin_dir.join("package.json"),
-            r#"{
-  "name": "qqbot",
-  "openclaw": {
-    "extensions": ["./index.ts"]
-  }
-}
-"#,
-        )
-        .expect("should write installed wrapper package.json");
-        fs::write(installed_plugin_dir.join("index.ts"), "export default {};
-")
-            .expect("should write installed wrapper entry");
+        let resolved =
+            resolve_openclaw_entry(&temp_root).expect("should resolve official openclaw entry");
 
-        let resolved = resolve_qq_plugin_path_for_config(&openclaw_home, Some(&engine_dir))
-            .expect("should resolve qqbot runtime path")
-            .expect("should prefer bundled qqbot runtime path");
-
-        assert_eq!(resolved, bundled_plugin_dir.display().to_string());
+        assert_eq!(resolved, entry_path);
 
         let _ = fs::remove_dir_all(&temp_root);
     }
 
     #[test]
-    fn repair_plugin_load_paths_generates_runtime_ready_qq_wrapper_for_source_only_bundle() {
+    fn initial_qq_channel_config_uses_official_bundled_plugin_schema() {
+        let mut root = Map::new();
+
+        apply_initial_qq_channel_config(&mut root, "demo-app", "demo-secret", None)
+            .expect("should apply qqbot channel config");
+
+        let qqbot = root
+            .get("channels")
+            .and_then(Value::as_object)
+            .and_then(|channels| channels.get("qqbot"))
+            .and_then(Value::as_object)
+            .expect("qqbot channel config should be present");
+
+        assert_eq!(qqbot.get("enabled"), Some(&Value::Bool(true)));
+        assert_eq!(
+            qqbot.get("appId"),
+            Some(&Value::String(String::from("demo-app")))
+        );
+        assert_eq!(
+            qqbot.get("clientSecret"),
+            Some(&Value::String(String::from("demo-secret")))
+        );
+        assert!(
+            !qqbot.contains_key("dmPolicy"),
+            "official qqbot schema rejects dmPolicy"
+        );
+        assert!(
+            !root.contains_key("plugins"),
+            "official bundled qqbot plugin should not be overridden by config plugin"
+        );
+    }
+
+    #[test]
+    fn repair_plugin_load_paths_removes_qqbot_plugin_overrides() {
         let unique = format!(
-            "whereclaw-qqbot-test-{}-{}",
+            "whereclaw-qqbot-repair-test-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -6416,28 +6863,10 @@ mod tests {
         );
         let temp_root = std::env::temp_dir().join(unique);
         let openclaw_home = temp_root.join("openclaw-home");
+        let other_plugin_dir = temp_root.join("other-plugin");
+        fs::create_dir_all(&other_plugin_dir).expect("should create unrelated plugin dir");
+        let other_plugin_path = other_plugin_dir.display().to_string();
         let engine_dir = temp_root.join("whereclaw-engine");
-        let bundled_plugin_dir = engine_dir
-            .join("openclaw")
-            .join("node_modules")
-            .join("openclaw-cn")
-            .join("extensions")
-            .join("qqbot");
-
-        fs::create_dir_all(bundled_plugin_dir.join("src"))
-            .expect("should create bundled qqbot source directory");
-        fs::write(
-            bundled_plugin_dir.join("openclaw.plugin.json"),
-            r#"{"id":"qqbot","channels":["qqbot"],"configSchema":{"type":"object","additionalProperties":false,"properties":{}}}"#,
-        )
-        .expect("should write bundled qqbot manifest");
-        fs::write(
-            bundled_plugin_dir.join("src").join("channel.ts"),
-            "export const qqbotPlugin = { id: 'qqbot' };\n",
-        )
-        .expect("should write bundled qqbot channel entry");
-
-        let bundled_path = bundled_plugin_dir.display().to_string();
         let mut root = serde_json::json!({
             "channels": {
                 "qqbot": {
@@ -6450,10 +6879,17 @@ mod tests {
                 "entries": {
                     "qqbot": {
                         "enabled": true
+                    },
+                    "other": {
+                        "enabled": true
                     }
                 },
                 "load": {
-                    "paths": [bundled_path]
+                    "paths": [
+                        "/Users/demo/whereclaw-engine/openclaw/node_modules/openclaw/dist/extensions/qqbot",
+                        "/Users/demo/openclaw-home/extensions/qqbot",
+                        other_plugin_path
+                    ]
                 }
             }
         });
@@ -6465,7 +6901,12 @@ mod tests {
         )
         .expect("should repair qqbot plugin load path");
 
-        let generated_path = openclaw_home.join("extensions").join("qqbot");
+        let entries = root
+            .get("plugins")
+            .and_then(Value::as_object)
+            .and_then(|plugins| plugins.get("entries"))
+            .and_then(Value::as_object)
+            .expect("plugin entries should remain");
         let paths = root
             .get("plugins")
             .and_then(Value::as_object)
@@ -6474,20 +6915,14 @@ mod tests {
             .and_then(|load| load.get("paths"))
             .and_then(Value::as_array)
             .expect("repaired config should have plugin load paths");
-        let normalized_paths = paths
-            .iter()
-            .filter_map(Value::as_str)
-            .map(String::from)
-            .collect::<Vec<_>>();
 
         assert!(changed);
-        assert!(
-            normalized_paths.contains(&generated_path.display().to_string()),
-            "repaired paths should point at generated qqbot wrapper dir"
+        assert!(!entries.contains_key("qqbot"));
+        assert!(entries.contains_key("other"));
+        assert_eq!(
+            paths,
+            &vec![Value::String(other_plugin_dir.display().to_string())]
         );
-        assert!(generated_path.join("index.ts").exists());
-        assert!(generated_path.join("package.json").exists());
-        assert!(generated_path.join("openclaw.plugin.json").exists());
 
         let _ = fs::remove_dir_all(&temp_root);
     }

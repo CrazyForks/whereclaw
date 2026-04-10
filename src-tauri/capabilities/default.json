@@ -4,7 +4,8 @@
   "description": "enables the default permissions",
   "windows": [
     "main",
-    "control-ui"
+    "control-ui",
+    "clawhub-marketplace"
   ],
   "permissions": [
     "core:default",

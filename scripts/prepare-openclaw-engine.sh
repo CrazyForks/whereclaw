@@ -14,6 +14,7 @@ cleanup() {
 trap cleanup EXIT
 
 NODE_VERSION="${NODE_VERSION:-22.20.0}"
+WEIXIN_CHANNEL_PLUGIN_SPEC="${WEIXIN_CHANNEL_PLUGIN_SPEC:-@tencent-weixin/openclaw-weixin@latest}"
 OPTIONAL_CHANNEL_PLUGIN_DIRS=(
   "bluebubbles"
   "feishu"
@@ -320,6 +321,41 @@ install_openclaw() {
   cp -R "$package_root/dist/control-ui" "$runtime_control_ui_dir"
 }
 
+install_bundled_weixin_plugin() {
+  local runtime_bin="$NODE_RUNTIME_DIR/bin"
+  local npm_binary="$runtime_bin/npm"
+  local node_binary="$runtime_bin/node"
+  local npm_cache="$TEMP_DIR/npm-cache"
+  local extensions_root="$ENGINE_DIR/openclaw/node_modules/openclaw/dist/extensions"
+  local plugin_root="$extensions_root/openclaw-weixin"
+  local pack_root="$TEMP_DIR/openclaw-weixin-pack"
+  local extract_root="$TEMP_DIR/openclaw-weixin-extract"
+  local tarball_name
+
+  mkdir -p "$pack_root" "$extract_root" "$extensions_root"
+
+  echo "Bundling WeChat plugin $WEIXIN_CHANNEL_PLUGIN_SPEC..."
+  tarball_name="$(
+    cd "$pack_root" && \
+      PATH="$runtime_bin:$PATH" NPM_CONFIG_CACHE="$npm_cache" npm_config_cache="$npm_cache" \
+      "$npm_binary" pack "$WEIXIN_CHANNEL_PLUGIN_SPEC" --silent
+  )"
+
+  tar -xzf "$pack_root/$tarball_name" -C "$extract_root"
+
+  rm -rf "$plugin_root"
+  mkdir -p "$plugin_root"
+  cp -R "$extract_root/package"/. "$plugin_root"
+
+  echo "Installing bundled plugin dependencies for openclaw-weixin..."
+  PATH="$runtime_bin:$PATH" NPM_CONFIG_CACHE="$npm_cache" npm_config_cache="$npm_cache" \
+    "$npm_binary" install --prefix "$plugin_root" --no-audit --no-fund --omit=dev
+  remove_unsafe_plugin_local_links "$plugin_root"
+
+  echo "Compiling bundled WeChat plugin to JavaScript..."
+  "$node_binary" "$ROOT_DIR/scripts/compile-bundled-weixin-plugin.mjs" "$plugin_root"
+}
+
 remove_unsafe_plugin_local_links() {
   local plugin_root="$1"
   local plugin_node_modules="$plugin_root/node_modules"
@@ -365,6 +401,7 @@ main() {
   download_and_extract_node
   download_and_extract_ollama
   install_openclaw
+  install_bundled_weixin_plugin
   install_optional_channel_plugin_dependencies
 
   if [[ ! -f "$ENGINE_DIR/templates/openclaw.json" ]]; then

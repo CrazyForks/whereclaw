@@ -2,8 +2,12 @@ import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  getChannelContinueButtonState,
+  type InitialChannelSelection,
+} from "./onboarding/channelStep.ts";
 import { getModelStepUiState } from "./onboarding/modelStep.ts";
-import { getQqContinueButtonState } from "./onboarding/qqStep.ts";
+import { toRenderableWeixinQrSrc } from "./onboarding/weixinQr.ts";
 import {
   getGatewayStartState,
   getGatewayStatusCardState,
@@ -101,26 +105,6 @@ type InstalledSkillEntry = {
   enabled: boolean;
 };
 
-type SkillCatalogRefreshResult = {
-  version: string;
-  source: string;
-  updated: boolean;
-  desktopVersion: string | null;
-  desktopUpdateAvailable: boolean;
-};
-
-type RemoteNotificationsPayload = {
-  cn: string[];
-  en: string[];
-  source: string;
-};
-
-type RemoteDesktopVersionPayload = {
-  version: string | null;
-  updateAvailable: boolean;
-  source: string;
-};
-
 const MIN_LAUNCH_SPLASH_MS = 2000;
 
 const LOCAL_MODEL_OPTIONS = [
@@ -152,10 +136,23 @@ type StatusLogContext = Record<string, unknown>;
 
 type InitialSetupConfigRequest = {
   localModel?: string;
+  channelSelection?: InitialChannelSelection;
   qq?: {
     appId: string;
     appSecret: string;
   };
+};
+
+type StartWeixinLoginResult = {
+  qrDataUrl: string | null;
+  sessionKey: string;
+  message: string;
+};
+
+type WaitWeixinLoginResult = {
+  connected: boolean;
+  accountId: string | null;
+  message: string;
 };
 
 type SystemMemoryInfo = {
@@ -163,7 +160,7 @@ type SystemMemoryInfo = {
   gpuTotalBytes: number | null;
 };
 
-type Screen = "language" | "model" | "qq" | "main";
+type Screen = "language" | "model" | "channel" | "main";
 type MainNav = "overview" | "config" | "logs";
 type ConfigPage =
   | "local-model"
@@ -182,7 +179,7 @@ type LocalModelPageDraft = {
 
 type Copy = {
   brandName: string;
-  brandSlogan: string;
+  brandSlogan: (openclawVersion: string | null) => string;
   officialWebsiteLabel: string;
   updateAvailableLabel: string;
   consoleVersionName: string;
@@ -202,7 +199,21 @@ type Copy = {
   saving: string;
   loading: string;
   modelQuestion: string;
-  qqQuestion: string;
+  channelQuestion: string;
+  channelDescription: string;
+  channelWeixinLabel: string;
+  channelQqLabel: string;
+  channelSkipLabel: string;
+  weixinDescription: string;
+  weixinStepTitle: string;
+  weixinStepLines: string[];
+  weixinQrPending: string;
+  weixinQrReady: string;
+  weixinQrExpired: string;
+  weixinQrWaiting: string;
+  weixinLoginFailed: string;
+  weixinLoginRetry: string;
+  weixinQrAlt: string;
   qqDescription: string;
   qqStepTitle: string;
   qqStepLines: string[];
@@ -403,8 +414,10 @@ type Copy = {
 const copyByLanguage: Record<LauncherLanguage, Copy> = {
   en: {
     brandName: "WhereClaw",
-    brandSlogan:
-      "The original official OpenClaw little lobster 🦞. Run local models for free, eliminate token anxiety, and deploy with zero-config in one click.",
+    brandSlogan: (openclawVersion) =>
+      `The original official OpenClaw little lobster 🦞. OpenClaw v${
+        openclawVersion ?? "..."
+      }. Run local models for free, eliminate token anxiety, and deploy with zero-config in one click.`,
     officialWebsiteLabel: "Official Website",
     updateAvailableLabel: "Update available",
     consoleVersionName: "Console",
@@ -424,7 +437,26 @@ const copyByLanguage: Record<LauncherLanguage, Copy> = {
     saving: "Saving...",
     loading: "Loading...",
     modelQuestion: "Run a local model?",
-    qqQuestion: "Configure QQ channel?",
+    channelQuestion: "Connect a chat channel?",
+    channelDescription: "Choose the channel to connect during initialization.",
+    channelWeixinLabel: "WeChat",
+    channelQqLabel: "QQ",
+    channelSkipLabel: "Skip For Now",
+    weixinDescription:
+      "WhereClaw can connect to WeChat with the bundled plugin and complete QR login here.",
+    weixinStepTitle: "WeChat Login",
+    weixinStepLines: [
+      "Click next to start QR login.",
+      "Scan the QR code with WeChat on your phone.",
+      "Wait for authorization to complete here.",
+    ],
+    weixinQrPending: "Click next to generate a WeChat QR code.",
+    weixinQrReady: "Scan this QR code with WeChat to continue.",
+    weixinQrExpired: "The QR code expired. Click next to generate a new one.",
+    weixinQrWaiting: "Waiting for WeChat authorization...",
+    weixinLoginFailed: "WeChat login failed.",
+    weixinLoginRetry: "Retry WeChat Login",
+    weixinQrAlt: "WeChat login QR code",
     qqDescription: "You can chat with OpenClaw through QQ after setup.",
     qqStepTitle: "Setup Steps",
     qqStepLines: [
@@ -654,8 +686,10 @@ const copyByLanguage: Record<LauncherLanguage, Copy> = {
   },
   "zh-CN": {
     brandName: "WhereClaw自由龙虾",
-    brandSlogan:
-      "OpenClaw官方原版小龙虾🦞，运行本地模型全免费，告别token焦虑，没有网络问题，零配置轻松一键部署。",
+    brandSlogan: (openclawVersion) =>
+      `OpenClaw官方原版小龙虾🦞，OpenClaw v${
+        openclawVersion ?? "..."
+      }，运行本地模型全免费，告别token焦虑，没有网络问题，零配置轻松一键部署。`,
     officialWebsiteLabel: "官方网站",
     updateAvailableLabel: "发现新版本",
     consoleVersionName: "自由龙虾",
@@ -675,7 +709,26 @@ const copyByLanguage: Record<LauncherLanguage, Copy> = {
     saving: "正在保存...",
     loading: "加载中...",
     modelQuestion: "是否在本地运行大模型？",
-    qqQuestion: "是否配置 QQ 通道？",
+    channelQuestion: "是否接入对话通道？",
+    channelDescription: "选择要在初始化阶段完成接入的通道。",
+    channelWeixinLabel: "微信",
+    channelQqLabel: "QQ",
+    channelSkipLabel: "暂不接入",
+    weixinDescription:
+      "WhereClaw 会使用内置的微信插件，并在这里完成扫码登录。",
+    weixinStepTitle: "微信登录",
+    weixinStepLines: [
+      "点击下一步开始生成微信二维码。",
+      "使用手机微信扫码。",
+      "等待授权结果返回到当前页面。",
+    ],
+    weixinQrPending: "点击下一步生成微信二维码。",
+    weixinQrReady: "请使用微信扫描此二维码继续。",
+    weixinQrExpired: "二维码已过期，请点击下一步重新生成。",
+    weixinQrWaiting: "正在等待微信授权...",
+    weixinLoginFailed: "微信登录失败。",
+    weixinLoginRetry: "重新登录微信",
+    weixinQrAlt: "微信登录二维码",
     qqDescription: "配置后可以通过 QQ 和 OpenClaw 沟通。",
     qqStepTitle: "配置步骤",
     qqStepLines: [
@@ -939,10 +992,15 @@ export default function App() {
   const [isValidatingLocalModelName, setIsValidatingLocalModelName] =
     useState(false);
   const [modelStepMessage, setModelStepMessage] = useState("");
-  const [wantsQqChannel, setWantsQqChannel] = useState<boolean | null>(null);
+  const [selectedChannel, setSelectedChannel] =
+    useState<InitialChannelSelection>("weixin");
   const [qqAppId, setQqAppId] = useState("");
   const [qqAppSecret, setQqAppSecret] = useState("");
   const [isApplyingInitialSetup, setIsApplyingInitialSetup] = useState(false);
+  const [isStartingWeixinLogin, setIsStartingWeixinLogin] = useState(false);
+  const [isWaitingForWeixinLogin, setIsWaitingForWeixinLogin] = useState(false);
+  const [weixinQrImageSrc, setWeixinQrImageSrc] = useState<string | null>(null);
+  const [weixinLoginMessage, setWeixinLoginMessage] = useState("");
   const [localModelRunProgress, setLocalModelRunProgress] =
     useState<LocalModelRunProgress | null>(null);
   const [isChannelListLoading, setIsChannelListLoading] = useState(false);
@@ -1011,10 +1069,7 @@ export default function App() {
     useState<SystemMemoryInfo | null>(null);
   const [memoryInfoFailed, setMemoryInfoFailed] = useState(false);
   const [appVersion, setAppVersion] = useState<string | null>(null);
-  const [remoteNotifications, setRemoteNotifications] = useState<RemoteNotificationsPayload | null>(null);
-  const [remoteDesktopVersion, setRemoteDesktopVersion] = useState<string | null>(null);
-  const [hasDesktopUpdate, setHasDesktopUpdate] = useState(false);
-  const [activeNotificationIndex, setActiveNotificationIndex] = useState(0);
+  const [openclawVersion, setOpenclawVersion] = useState<string | null>(null);
 
   const appendFrontendStatusLog = (
     level: StatusLogLevel,
@@ -1070,63 +1125,12 @@ export default function App() {
     appendFrontendStatusLog("INFO", "statusMessage cleared", context);
   };
 
-  const ensureRemoteSkillCatalogFresh = () => {
-    if (!remoteSkillCatalogRefreshPromiseRef.current) {
-      remoteSkillCatalogRefreshPromiseRef.current = invoke<SkillCatalogRefreshResult>(
-        "ensure_remote_skill_catalog_fresh",
-      )
-        .then(async (result) => {
-          setRemoteDesktopVersion(result.desktopVersion);
-          setHasDesktopUpdate(result.desktopUpdateAvailable);
-          try {
-            const notifications = await invoke<RemoteNotificationsPayload>(
-              "read_remote_notifications",
-            );
-            setRemoteNotifications(notifications);
-          } catch {
-            setRemoteNotifications(null);
-          }
-          return result;
-        })
-        .catch(async () => {
-          setRemoteNotifications(null);
-          try {
-            const desktopVersion = await invoke<RemoteDesktopVersionPayload>(
-              "read_remote_desktop_version",
-            );
-            setRemoteDesktopVersion(desktopVersion.version);
-            setHasDesktopUpdate(desktopVersion.updateAvailable);
-          } catch {
-            setRemoteDesktopVersion(null);
-            setHasDesktopUpdate(false);
-          }
-          return null;
-        });
-    }
-
-    return remoteSkillCatalogRefreshPromiseRef.current;
-  };
-
   const contentScrollContainerRef = useRef<HTMLElement | null>(null);
   const logsContainerRef = useRef<HTMLPreElement | null>(null);
   const shouldStickLogsToBottomRef = useRef(true);
-  const remoteSkillCatalogRefreshPromiseRef = useRef<
-    Promise<SkillCatalogRefreshResult | null> | null
-  >(null);
 
   const copy = copyByLanguage[selectedLanguage];
-  const visibleNotifications =
-    selectedLanguage === "zh-CN"
-      ? remoteNotifications?.cn ?? []
-      : remoteNotifications?.en ?? [];
-  const activeNotification =
-    visibleNotifications.length > 0
-      ? visibleNotifications[activeNotificationIndex % visibleNotifications.length]
-      : null;
   const consoleVersionLabel = `${copy.consoleVersionName} v${appVersion ?? "..."}`;
-  const desktopUpdateTitle = remoteDesktopVersion
-    ? `${copy.updateAvailableLabel} · v${remoteDesktopVersion}`
-    : copy.updateAvailableLabel;
   const configured = setupInfo?.configured ?? false;
   const isReady = gatewayStatus?.running ?? false;
   const isOllamaReady = ollamaStatus?.running ?? false;
@@ -1202,7 +1206,7 @@ export default function App() {
     localModelRunProgress,
   };
   const gatewayStartState = getGatewayStartState(gatewayStateInput);
-  const gatewayStatusCardState = getGatewayStatusCardState(gatewayStateInput);
+  const gatewayStatusCardState = getGatewayStatusCardState();
   const openClawModelsByProvider = useMemo(() => {
     const grouped = new Map<string, ModelCatalogEntry[]>();
     for (const entry of openclawModels) {
@@ -1425,7 +1429,6 @@ export default function App() {
         );
         setPreferences(nextPreferences);
         setSelectedLanguage(nextPreferences.language);
-        void ensureRemoteSkillCatalogFresh();
 
         if (nextPreferences.isInitialized) {
           await refreshMainState(nextPreferences.language);
@@ -1466,22 +1469,15 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    setActiveNotificationIndex(0);
-  }, [selectedLanguage, remoteNotifications]);
-
-  useEffect(() => {
-    if (visibleNotifications.length <= 1) return;
-
-    const timer = window.setInterval(() => {
-      setActiveNotificationIndex((current) =>
-        (current + 1) % visibleNotifications.length,
-      );
-    }, 3000);
-
-    return () => {
-      window.clearInterval(timer);
-    };
-  }, [visibleNotifications]);
+    void (async () => {
+      try {
+        const version = await invoke<string>("read_bundled_openclaw_version_command");
+        setOpenclawVersion(version);
+      } catch {
+        setOpenclawVersion(null);
+      }
+    })();
+  }, []);
 
   useEffect(() => {
     void (async () => {
@@ -1692,7 +1688,9 @@ export default function App() {
     setWantsLocalModel(null);
     setLocalModelName(resolvedDefaultLocalModelName);
     setModelToPull(resolvedDefaultLocalModelName);
-    setWantsQqChannel(null);
+    setSelectedChannel("weixin");
+    setWeixinQrImageSrc(null);
+    setWeixinLoginMessage("");
     setQqAppId("");
     setQqAppSecret("");
     setMainNav("overview");
@@ -1763,47 +1761,99 @@ export default function App() {
     }
 
     setModelStepMessage("");
-    clearStatusMessage({ action: "handleContinueModelStep", nextScreen: "qq" });
-    setScreen("qq");
+    setSelectedChannel("weixin");
+      setWeixinQrImageSrc(null);
+    setWeixinLoginMessage("");
+    clearStatusMessage({
+      action: "handleContinueModelStep",
+      nextScreen: "channel",
+    });
+    setScreen("channel");
   };
 
-  const handleContinueQqStep = async () => {
+  const handleContinueChannelStep = async () => {
     if (isApplyingInitialSetup) return;
-    if (wantsQqChannel === null) return;
     if (
-      wantsQqChannel &&
+      selectedChannel === "qq" &&
       (qqAppId.trim().length === 0 || qqAppSecret.trim().length === 0)
-    )
+    ) {
       return;
+    }
 
     const request: InitialSetupConfigRequest = {};
-    setIsApplyingInitialSetup(true);
-    try {
-      if (wantsLocalModel) {
-        request.localModel = localModelName.trim();
-      }
-      if (wantsQqChannel) {
-        request.qq = {
-          appId: qqAppId.trim(),
-          appSecret: qqAppSecret.trim(),
-        };
-      }
+    if (wantsLocalModel) {
+      request.localModel = localModelName.trim();
+    }
+    request.channelSelection = selectedChannel;
+    if (selectedChannel === "qq") {
+      request.qq = {
+        appId: qqAppId.trim(),
+        appSecret: qqAppSecret.trim(),
+      };
+    }
 
+    if (selectedChannel === "weixin") {
+      setWeixinQrImageSrc(null);
+      setWeixinLoginMessage("");
+    }
+
+    setIsApplyingInitialSetup(selectedChannel !== "weixin");
+    try {
       await invoke("apply_initial_setup_config", { request });
-      if (preferences) {
-        setPreferences({
-          ...preferences,
-          isInitialized: true,
-          isInitializationInProgress: false,
-          hasSavedPreferences: true,
-        });
-      }
     } catch (error) {
+      setIsApplyingInitialSetup(false);
       showStatusError(error, copy.applyInitialSetupFailed, {
-        action: "handleContinueQqStep",
+        action: "handleContinueChannelStep",
         request,
       });
       return;
+    }
+
+    if (selectedChannel === "weixin") {
+      setIsStartingWeixinLogin(true);
+      try {
+        const startResult = await invoke<StartWeixinLoginResult>(
+          "start_initial_weixin_login",
+        );
+        setWeixinQrImageSrc(
+          startResult.qrDataUrl
+            ? await toRenderableWeixinQrSrc(startResult.qrDataUrl)
+            : null,
+        );
+        setWeixinLoginMessage(startResult.message);
+        setIsStartingWeixinLogin(false);
+        setIsWaitingForWeixinLogin(true);
+
+        const waitResult = await invoke<WaitWeixinLoginResult>(
+          "wait_for_initial_weixin_login",
+          {
+            sessionKey: startResult.sessionKey,
+          },
+        );
+
+        setIsWaitingForWeixinLogin(false);
+        setWeixinLoginMessage(waitResult.message);
+        if (!waitResult.connected) {
+          return;
+        }
+      } catch (error) {
+        setIsStartingWeixinLogin(false);
+        setIsWaitingForWeixinLogin(false);
+        showStatusError(error, copy.weixinLoginFailed, {
+          action: "handleContinueChannelStep",
+          channel: selectedChannel,
+        });
+        return;
+      }
+    }
+
+    if (preferences) {
+      setPreferences({
+        ...preferences,
+        isInitialized: true,
+        isInitializationInProgress: false,
+        hasSavedPreferences: true,
+      });
     }
 
     try {
@@ -1811,11 +1861,13 @@ export default function App() {
       setScreen("main");
     } catch (error) {
       showStatusError(error, copy.pullModelFailed, {
-        action: "handleContinueQqStep",
+        action: "handleContinueChannelStep",
         phase: "refreshMainState",
       });
     } finally {
       setIsApplyingInitialSetup(false);
+      setIsStartingWeixinLogin(false);
+      setIsWaitingForWeixinLogin(false);
     }
   };
 
@@ -2767,52 +2819,121 @@ export default function App() {
     );
   }
 
-  if (screen === "qq") {
-    const qqContinueButtonState = getQqContinueButtonState({
-      wantsQqChannel,
+  if (screen === "channel") {
+    const channelContinueButtonState = getChannelContinueButtonState({
+      selectedChannel,
       qqAppId,
       qqAppSecret,
       isApplyingInitialSetup,
+      isStartingWeixinLogin,
+      isWaitingForWeixinLogin,
     });
-    const disableContinue = qqContinueButtonState.disabled;
+    const disableContinue = channelContinueButtonState.disabled;
 
     return (
       <main className={appFrameClass}>
         <div className="w-full max-w-xl">
           <section className={onboardingCardClass}>
-            <h2 className={titleClass}>{copy.qqQuestion}</h2>
+            <h2 className={titleClass}>{copy.channelQuestion}</h2>
             <p className={`mt-3 text-center ${bodyTextClass}`}>
-              {copy.qqDescription}
+              {copy.channelDescription}
             </p>
 
-            <div className="mt-6 grid grid-cols-2 gap-3">
+            <div className="mt-6 grid grid-cols-3 gap-3">
               <button
                 className={`${choiceButtonClass} ${
-                  wantsQqChannel === true
+                  selectedChannel === "weixin"
                     ? choiceButtonActiveClass
                     : choiceButtonInactiveClass
                 }`}
-                disabled={isApplyingInitialSetup}
-                onClick={() => setWantsQqChannel(true)}
+                disabled={isApplyingInitialSetup || isWaitingForWeixinLogin}
+                onClick={() => {
+                  setSelectedChannel("weixin");
+                  setWeixinQrImageSrc(null);
+                  setWeixinLoginMessage("");
+                }}
                 type="button"
               >
-                {copy.yes}
+                {copy.channelWeixinLabel}
               </button>
               <button
                 className={`${choiceButtonClass} ${
-                  wantsQqChannel === false
+                  selectedChannel === "qq"
                     ? choiceButtonActiveClass
                     : choiceButtonInactiveClass
                 }`}
-                disabled={isApplyingInitialSetup}
-                onClick={() => setWantsQqChannel(false)}
+                disabled={isApplyingInitialSetup || isWaitingForWeixinLogin}
+                onClick={() => {
+                  setSelectedChannel("qq");
+                  setWeixinQrImageSrc(null);
+                  setWeixinLoginMessage("");
+                }}
                 type="button"
               >
-                {copy.no}
+                {copy.channelQqLabel}
+              </button>
+              <button
+                className={`${choiceButtonClass} ${
+                  selectedChannel === "none"
+                    ? choiceButtonActiveClass
+                    : choiceButtonInactiveClass
+                }`}
+                disabled={isApplyingInitialSetup || isWaitingForWeixinLogin}
+                onClick={() => {
+                  setSelectedChannel("none");
+                  setWeixinQrImageSrc(null);
+                  setWeixinLoginMessage("");
+                }}
+                type="button"
+              >
+                {copy.channelSkipLabel}
               </button>
             </div>
 
-            {wantsQqChannel ? (
+            {selectedChannel === "weixin" ? (
+              <div className="mt-5 space-y-3">
+                <div className="rounded-[1.1rem] border border-slate-200 bg-slate-50/65 p-4 text-left">
+                  <p className="text-sm font-medium text-slate-900">
+                    {copy.weixinStepTitle}
+                  </p>
+                  <p className="mt-2 text-sm leading-6 text-slate-600">
+                    {copy.weixinDescription}
+                  </p>
+                  <ol className="mt-2 list-decimal space-y-1 pl-5 text-sm leading-6 text-slate-600">
+                    {copy.weixinStepLines.map((line) => (
+                      <li key={line}>{line}</li>
+                    ))}
+                  </ol>
+                </div>
+                <div className="rounded-[1.1rem] border border-slate-200 bg-white p-4 text-center">
+                  {weixinQrImageSrc ? (
+                    <div className="space-y-3">
+                      <p className="text-sm text-slate-600">
+                        {isWaitingForWeixinLogin
+                          ? copy.weixinQrWaiting
+                          : copy.weixinQrReady}
+                      </p>
+                      <img
+                        alt={copy.weixinQrAlt}
+                        className="mx-auto w-full max-w-[16rem] rounded-xl border border-slate-200 bg-white p-3"
+                        src={weixinQrImageSrc}
+                      />
+                    </div>
+                  ) : (
+                    <p className="text-sm text-slate-600">
+                      {weixinLoginMessage || copy.weixinQrPending}
+                    </p>
+                  )}
+                  {weixinLoginMessage && weixinQrImageSrc ? (
+                    <p className="mt-3 text-sm text-slate-600">
+                      {weixinLoginMessage}
+                    </p>
+                  ) : null}
+                </div>
+              </div>
+            ) : null}
+
+            {selectedChannel === "qq" ? (
               <div className="mt-5 space-y-3">
                 <div className="rounded-[1.1rem] border border-slate-200 bg-slate-50/65 p-4 text-left">
                   <p className="text-sm font-medium text-slate-900">
@@ -2865,6 +2986,12 @@ export default function App() {
               </div>
             ) : null}
 
+            {selectedChannel === "none" ? (
+              <div className="mt-5 rounded-[1.1rem] border border-slate-200 bg-slate-50/65 p-4 text-left text-sm leading-6 text-slate-600">
+                {copy.channelSkipLabel}
+              </div>
+            ) : null}
+
             {statusMessage ? (
               <p className="mt-4 text-center text-sm text-red-600">
                 {statusMessage}
@@ -2876,10 +3003,10 @@ export default function App() {
             <button
               aria-label={copy.backAriaLabel}
               className={iconButtonClass}
-              disabled={isApplyingInitialSetup}
+              disabled={isApplyingInitialSetup || isWaitingForWeixinLogin}
               onClick={() => {
                 clearStatusMessage({
-                  action: "navigateBackFromQqScreen",
+                  action: "navigateBackFromChannelScreen",
                   nextScreen: "model",
                 });
                 setScreen("model");
@@ -2889,18 +3016,20 @@ export default function App() {
               <ChevronLeftIcon />
             </button>
             <button
-              aria-busy={qqContinueButtonState.showLoading}
+              aria-busy={channelContinueButtonState.showLoading}
               aria-label={
-                qqContinueButtonState.showLoading
-                  ? copy.loading
+                channelContinueButtonState.showLoading
+                  ? selectedChannel === "weixin"
+                    ? copy.weixinQrWaiting
+                    : copy.loading
                   : copy.nextAriaLabel
               }
               className={iconButtonClass}
               disabled={disableContinue}
-              onClick={() => void handleContinueQqStep()}
+              onClick={() => void handleContinueChannelStep()}
               type="button"
             >
-              {qqContinueButtonState.showLoading ? (
+              {channelContinueButtonState.showLoading ? (
                 <SpinnerIcon />
               ) : (
                 <ChevronRightIcon />
@@ -2915,14 +3044,6 @@ export default function App() {
   return (
     <main className={appFrameClass}>
       <div className="mx-auto flex h-[calc(100dvh-2rem)] w-full max-w-6xl flex-col gap-3 p-4 sm:h-[calc(100dvh-2.5rem)] sm:p-5 lg:h-[calc(100dvh-3rem)] lg:p-6">
-        {activeNotification ? (
-          <p
-            className="pl-4 text-left text-[0.72rem] leading-5 text-slate-500 sm:pl-5"
-            key={`${selectedLanguage}-${activeNotificationIndex}`}
-          >
-            {activeNotification}
-          </p>
-        ) : null}
         <div className="grid min-h-0 flex-1 gap-4 lg:grid-cols-[16rem_minmax(0,1fr)]">
           <aside className="flex h-full flex-col rounded-3xl bg-white/72 p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.9)] backdrop-blur-2xl sm:p-5">
             <div>
@@ -2935,17 +3056,6 @@ export default function App() {
               </div>
               <div className="mt-1 flex items-center justify-center gap-1.5 text-sm text-slate-500">
                 <p>{consoleVersionLabel}</p>
-                {hasDesktopUpdate ? (
-                  <button
-                    aria-label={desktopUpdateTitle}
-                    className="inline-flex h-5 w-5 items-center justify-center text-emerald-600 transition hover:text-emerald-700"
-                    onClick={() => void handleOpenWhereClawWebsite()}
-                    title={desktopUpdateTitle}
-                    type="button"
-                  >
-                    <UpdateAvailableIcon />
-                  </button>
-                ) : null}
               </div>
             </div>
 
@@ -4304,7 +4414,7 @@ export default function App() {
           </section>
         </div>
         <p className="pl-4 text-left text-[0.72rem] leading-5 text-slate-500 sm:pl-5">
-          {copy.brandSlogan}
+          {copy.brandSlogan(openclawVersion)}
         </p>
       </div>
 
@@ -5466,34 +5576,6 @@ function TerminalIcon() {
         d="M12.5 14H16.5"
         stroke="currentColor"
         strokeLinecap="round"
-        strokeWidth="1.8"
-      />
-    </svg>
-  );
-}
-
-function UpdateAvailableIcon() {
-  return (
-    <svg aria-hidden="true" className="h-5 w-5" fill="none" viewBox="0 0 24 24">
-      <path
-        d="M12 4V14"
-        stroke="currentColor"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        strokeWidth="1.8"
-      />
-      <path
-        d="M8.5 10.5L12 14L15.5 10.5"
-        stroke="currentColor"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        strokeWidth="1.8"
-      />
-      <path
-        d="M5 16.5V17C5 18.1046 5.89543 19 7 19H17C18.1046 19 19 18.1046 19 17V16.5"
-        stroke="currentColor"
-        strokeLinecap="round"
-        strokeLinejoin="round"
         strokeWidth="1.8"
       />
     </svg>

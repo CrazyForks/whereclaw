@@ -5,9 +5,10 @@ use std::{
     fs,
     fs::OpenOptions,
     hash::{Hash, Hasher},
-    io::{Read, Write},
+    io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Child as StdChild, Command, Stdio},
+    sync::mpsc::{self, Receiver},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -17,7 +18,6 @@ use std::{
 };
 
 use portable_pty::{Child as PtyChild, CommandBuilder, MasterPty};
-use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sysinfo::{System, SystemExt};
@@ -57,13 +57,10 @@ const CLAWHUB_CN_WINDOW_TITLE: &str = "ClawHub官方镜像站，WhereClaw一键�
 const CLAWHUB_EN_WINDOW_TITLE: &str = "ClawHub, install with WhereClaw";
 const CLAWHUB_INSTALL_COMMAND: &str = "install_current_clawhub_marketplace_skill";
 const CLAWHUB_STATUS_COMMAND: &str = "read_current_clawhub_marketplace_skill_installation_status";
-const REMOTE_SKILLS_MANIFEST_URL: &str = "https://r2.tolearn.cc/manifest.json";
-const REMOTE_SKILLS_DIR_NAME: &str = "remote-skills";
-const REMOTE_SKILLS_FILE_NAME: &str = "skills.json";
-const REMOTE_SKILLS_METADATA_FILE_NAME: &str = "metadata.json";
 const TRAY_ICON_ID: &str = "main";
 const TRAY_MENU_SHOW_ID: &str = "tray_show";
 const TRAY_MENU_QUIT_ID: &str = "tray_quit";
+const WEIXIN_CHANNEL_ID: &str = "openclaw-weixin";
 
 enum GatewayChild {
     Pty {
@@ -140,6 +137,10 @@ struct LocalModelRunState {
 
 struct ExitIntentState {
     quitting: AtomicBool,
+}
+
+struct InitialWeixinLoginState {
+    pending: Arc<Mutex<HashMap<String, Receiver<Result<InitialWeixinLoginWaitResult, String>>>>>,
 }
 
 fn show_main_window(app: &AppHandle) -> Result<(), String> {
@@ -345,88 +346,6 @@ struct ClawhubSkillInstallationStatus {
     installed: bool,
 }
 
-#[derive(Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct BundledVersionManifest {
-    skills_catalog_version: String,
-}
-
-#[derive(Clone, Deserialize)]
-struct RemoteManifest {
-    skills: Option<RemoteSkillsManifest>,
-    desktop: Option<RemoteDesktopManifest>,
-    notifications: Option<RemoteNotificationsManifest>,
-}
-
-#[derive(Clone, Deserialize)]
-struct RemoteSkillsManifest {
-    version: String,
-    url: String,
-}
-
-#[derive(Clone, Deserialize)]
-struct RemoteDesktopManifest {
-    version: String,
-}
-
-#[derive(Clone, Deserialize)]
-struct RemoteNotificationsManifest {
-    #[serde(default)]
-    cn: Vec<String>,
-    #[serde(default)]
-    en: Vec<String>,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-struct CachedSkillCatalogMetadata {
-    version: String,
-    url: String,
-    #[serde(default)]
-    desktop_version: Option<String>,
-    #[serde(default = "empty_cached_notifications")]
-    notifications: CachedNotifications,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-struct CachedNotifications {
-    cn: Vec<String>,
-    en: Vec<String>,
-}
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ActiveSkillCatalogPayload {
-    version: String,
-    source: String,
-    catalog: Value,
-}
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SkillCatalogRefreshResult {
-    version: String,
-    source: String,
-    updated: bool,
-    desktop_version: Option<String>,
-    desktop_update_available: bool,
-}
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct RemoteNotificationsPayload {
-    cn: Vec<String>,
-    en: Vec<String>,
-    source: String,
-}
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct RemoteDesktopVersionPayload {
-    version: Option<String>,
-    update_available: bool,
-    source: String,
-}
-
 fn collect_system_memory_info() -> Result<SystemMemoryInfo, String> {
     let mut system = System::new();
     system.refresh_memory();
@@ -436,82 +355,6 @@ fn collect_system_memory_info() -> Result<SystemMemoryInfo, String> {
         total_ram_bytes,
         gpu_total_bytes,
     })
-}
-
-fn parse_bundled_version_manifest() -> Result<BundledVersionManifest, String> {
-    serde_json::from_str(include_str!("../../VERSION.json"))
-        .map_err(|error| format!("failed to parse bundled VERSION.json: {error}"))
-}
-
-fn read_bundled_skill_catalog() -> Result<ActiveSkillCatalogPayload, String> {
-    let version_manifest = parse_bundled_version_manifest()?;
-    let catalog = serde_json::from_str(include_str!("../../skills.json"))
-        .map_err(|error| format!("failed to parse bundled skills.json: {error}"))?;
-
-    Ok(ActiveSkillCatalogPayload {
-        version: version_manifest.skills_catalog_version,
-        source: String::from("bundled"),
-        catalog,
-    })
-}
-
-fn current_desktop_version(app: &AppHandle) -> String {
-    app.package_info().version.to_string()
-}
-
-fn is_remote_desktop_version_newer(remote_version: Option<&str>, current_version: &str) -> bool {
-    let Some(remote_version) = remote_version
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return false;
-    };
-
-    is_remote_version_newer(remote_version, current_version).unwrap_or(false)
-}
-
-fn empty_cached_notifications() -> CachedNotifications {
-    CachedNotifications {
-        cn: Vec::new(),
-        en: Vec::new(),
-    }
-}
-
-fn parse_semver_triplet(version: &str) -> Result<(u64, u64, u64), String> {
-    let normalized = version
-        .trim()
-        .split_once('-')
-        .map(|(value, _)| value)
-        .unwrap_or(version.trim())
-        .split_once('+')
-        .map(|(value, _)| value)
-        .unwrap_or(version.trim());
-    let mut parts = normalized.split('.');
-    let major = parts
-        .next()
-        .ok_or_else(|| format!("invalid semver version: {version}"))?
-        .parse::<u64>()
-        .map_err(|error| format!("invalid semver major component in {version}: {error}"))?;
-    let minor = parts
-        .next()
-        .ok_or_else(|| format!("invalid semver version: {version}"))?
-        .parse::<u64>()
-        .map_err(|error| format!("invalid semver minor component in {version}: {error}"))?;
-    let patch = parts
-        .next()
-        .ok_or_else(|| format!("invalid semver version: {version}"))?
-        .parse::<u64>()
-        .map_err(|error| format!("invalid semver patch component in {version}: {error}"))?;
-
-    if parts.next().is_some() {
-        return Err(format!("invalid semver version: {version}"));
-    }
-
-    Ok((major, minor, patch))
-}
-
-fn is_remote_version_newer(remote: &str, current: &str) -> Result<bool, String> {
-    Ok(parse_semver_triplet(remote)? > parse_semver_triplet(current)?)
 }
 
 #[cfg(target_os = "macos")]
@@ -697,11 +540,36 @@ struct InitialQqChannelConfig {
     app_secret: String,
 }
 
+#[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+enum InitialChannelSelection {
+    Weixin,
+    Qq,
+    None,
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct InitialSetupConfigRequest {
     local_model: Option<String>,
+    channel_selection: Option<InitialChannelSelection>,
     qq: Option<InitialQqChannelConfig>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InitialWeixinLoginStartResult {
+    qr_data_url: Option<String>,
+    message: String,
+    session_key: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InitialWeixinLoginWaitResult {
+    connected: bool,
+    message: String,
+    account_id: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -2258,14 +2126,6 @@ const __WHERECLAW_LOCALE__ = {locale_json};
         opening: 'Opening...',
       }};
 
-  const ensureLocale = () => {{
-    try {{
-      window.localStorage.setItem('openclaw.i18n.locale', __WHERECLAW_LOCALE__);
-    }} catch (_error) {{
-      // Ignore localStorage failures in injected setup.
-    }}
-  }};
-
   const ensureStyle = () => {{
     if (document.getElementById(OPEN_BUTTON_STYLE_ID)) return;
 
@@ -2319,8 +2179,7 @@ const __WHERECLAW_LOCALE__ = {locale_json};
   }};
 
   const ensureButton = () => {{
-    ensureLocale();
-    ensureStyle();
+  ensureStyle();
 
     if (document.getElementById(OPEN_BUTTON_ID)) return;
 
@@ -2359,6 +2218,86 @@ const __WHERECLAW_LOCALE__ = {locale_json};
     ))
 }
 
+fn resolve_dist_hashed_module_path(dist_dir: &Path, prefix: &str) -> Result<PathBuf, String> {
+    let mut matches = fs::read_dir(dist_dir)
+        .map_err(|error| format!("failed to read OpenClaw dist dir {}: {error}", dist_dir.display()))?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.starts_with(prefix) && name.ends_with(".js"))
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+
+    matches.sort();
+    matches
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("failed to find OpenClaw dist module with prefix {prefix}"))
+}
+
+fn resolve_dist_module_export_alias(source: &str, symbol: &str) -> Option<String> {
+    let export_start = source.rfind("export {")?;
+    let export_tail = &source[export_start + "export {".len()..];
+    let export_end = export_tail.find("};")?;
+    let export_list = &export_tail[..export_end];
+
+    for entry in export_list.split(',') {
+        let trimmed = entry.trim();
+        if let Some((internal, external)) = trimmed.split_once(" as ") {
+            if internal.trim() == symbol {
+                return Some(external.trim().to_string());
+            }
+            continue;
+        }
+        if trimmed == symbol {
+            return Some(symbol.to_string());
+        }
+    }
+
+    None
+}
+
+fn resolve_dist_module_path_with_exports(
+    dist_dir: &Path,
+    prefix: &str,
+    required_symbols: &[&str],
+) -> Result<(PathBuf, Vec<String>), String> {
+    let mut candidates = fs::read_dir(dist_dir)
+        .map_err(|error| format!("failed to read OpenClaw dist dir {}: {error}", dist_dir.display()))?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.starts_with(prefix) && name.ends_with(".js"))
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    candidates.sort();
+
+    for candidate in candidates {
+        let source = fs::read_to_string(&candidate)
+            .map_err(|error| format!("failed to read OpenClaw module {}: {error}", candidate.display()))?;
+        let aliases = required_symbols
+            .iter()
+            .map(|symbol| resolve_dist_module_export_alias(&source, symbol))
+            .collect::<Option<Vec<_>>>();
+        if let Some(aliases) = aliases {
+            return Ok((candidate, aliases));
+        }
+    }
+
+    Err(format!(
+        "failed to find OpenClaw dist module with prefix {prefix} exporting {}",
+        required_symbols.join(", ")
+    ))
+}
+
 #[tauri::command]
 async fn read_setup_info(app: AppHandle) -> Result<SetupInfo, String> {
     let app = app.clone();
@@ -2368,47 +2307,19 @@ async fn read_setup_info(app: AppHandle) -> Result<SetupInfo, String> {
 }
 
 #[tauri::command]
+async fn read_bundled_openclaw_version_command(app: AppHandle) -> Result<String, String> {
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || read_bundled_openclaw_version(&app))
+        .await
+        .map_err(|error| format!("failed to join bundled OpenClaw version task: {error}"))?
+}
+
+#[tauri::command]
 async fn read_launcher_preferences(app: AppHandle) -> Result<LauncherPreferences, String> {
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || read_launcher_preferences_impl(&app))
         .await
         .map_err(|error| format!("failed to join preferences read task: {error}"))?
-}
-
-#[tauri::command]
-async fn ensure_remote_skill_catalog_fresh(
-    app: AppHandle,
-) -> Result<SkillCatalogRefreshResult, String> {
-    let app = app.clone();
-    tauri::async_runtime::spawn_blocking(move || ensure_remote_skill_catalog_fresh_impl(&app))
-        .await
-        .map_err(|error| format!("failed to join remote skill catalog refresh task: {error}"))?
-}
-
-#[tauri::command]
-async fn read_active_skill_catalog(app: AppHandle) -> Result<ActiveSkillCatalogPayload, String> {
-    let app = app.clone();
-    tauri::async_runtime::spawn_blocking(move || read_active_skill_catalog_impl(&app))
-        .await
-        .map_err(|error| format!("failed to join active skill catalog read task: {error}"))?
-}
-
-#[tauri::command]
-async fn read_remote_notifications(app: AppHandle) -> Result<RemoteNotificationsPayload, String> {
-    let app = app.clone();
-    tauri::async_runtime::spawn_blocking(move || read_remote_notifications_impl(&app))
-        .await
-        .map_err(|error| format!("failed to join remote notifications read task: {error}"))?
-}
-
-#[tauri::command]
-async fn read_remote_desktop_version(
-    app: AppHandle,
-) -> Result<RemoteDesktopVersionPayload, String> {
-    let app = app.clone();
-    tauri::async_runtime::spawn_blocking(move || read_remote_desktop_version_impl(&app))
-        .await
-        .map_err(|error| format!("failed to join remote desktop version read task: {error}"))?
 }
 
 #[tauri::command]
@@ -2612,12 +2523,20 @@ async fn apply_initial_setup_config(
             }
         }
 
-        if let Some(qq) = request.qq {
-            let app_id = qq.app_id.trim();
-            let app_secret = qq.app_secret.trim();
-            if !app_id.is_empty() && !app_secret.is_empty() {
-                apply_initial_qq_channel_config(root, app_id, app_secret, None)?;
+        match request.channel_selection.unwrap_or(InitialChannelSelection::None) {
+            InitialChannelSelection::Weixin => {
+                apply_initial_weixin_channel_config(root)?;
             }
+            InitialChannelSelection::Qq => {
+                if let Some(qq) = request.qq {
+                    let app_id = qq.app_id.trim();
+                    let app_secret = qq.app_secret.trim();
+                    if !app_id.is_empty() && !app_secret.is_empty() {
+                        apply_initial_qq_channel_config(root, app_id, app_secret, None)?;
+                    }
+                }
+            }
+            InitialChannelSelection::None => {}
         }
 
         write_openclaw_config(&openclaw_home, &config)?;
@@ -2633,6 +2552,34 @@ async fn apply_initial_setup_config(
     })
     .await
     .map_err(|error| format!("failed to join initial setup task: {error}"))?
+}
+
+#[tauri::command]
+async fn start_initial_weixin_login(
+    app: AppHandle,
+    state: tauri::State<'_, InitialWeixinLoginState>,
+) -> Result<InitialWeixinLoginStartResult, String> {
+    let app = app.clone();
+    let pending = state.pending.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        start_initial_weixin_login_impl(&app, &pending)
+    })
+    .await
+    .map_err(|error| format!("failed to join weixin-login-start task: {error}"))?
+}
+
+#[tauri::command]
+async fn wait_for_initial_weixin_login(
+    _app: AppHandle,
+    state: tauri::State<'_, InitialWeixinLoginState>,
+    session_key: String,
+) -> Result<InitialWeixinLoginWaitResult, String> {
+    let pending = state.pending.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        wait_for_initial_weixin_login_impl(&pending, &session_key)
+    })
+    .await
+    .map_err(|error| format!("failed to join weixin-login-wait task: {error}"))?
 }
 
 #[tauri::command]
@@ -4357,418 +4304,48 @@ fn read_bundled_ollama_version(app: &AppHandle) -> Result<String, String> {
     Ok(String::from(trimmed))
 }
 
+fn read_bundled_openclaw_version_from_package_root(package_root: &Path) -> Result<String, String> {
+    let package_json_path = package_root.join("package.json");
+    let package_json = fs::read_to_string(&package_json_path).map_err(|error| {
+        format!(
+            "failed to read bundled OpenClaw package.json {}: {error}",
+            package_json_path.display()
+        )
+    })?;
+    let parsed: Value = serde_json::from_str(&package_json).map_err(|error| {
+        format!(
+            "failed to parse bundled OpenClaw package.json {}: {error}",
+            package_json_path.display()
+        )
+    })?;
+    let version = parsed
+        .get("version")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "bundled OpenClaw package.json is missing a non-empty version: {}",
+                package_json_path.display()
+            )
+        })?;
+
+    Ok(String::from(version))
+}
+
+fn read_bundled_openclaw_version(app: &AppHandle) -> Result<String, String> {
+    let engine_dir = resolve_engine_dir(app)?;
+    let entry_script = resolve_openclaw_entry(&engine_dir)?;
+    let package_root = resolve_openclaw_package_root(&entry_script)?;
+    read_bundled_openclaw_version_from_package_root(&package_root)
+}
+
 fn resolve_default_openclaw_home_dir(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(resolve_launcher_data_dir(app)?.join("openclaw-home"))
 }
 
 fn resolve_launcher_settings_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(resolve_launcher_data_dir(app)?.join("launcher-settings.json"))
-}
-
-fn resolve_remote_skills_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    Ok(resolve_launcher_data_dir(app)?.join(REMOTE_SKILLS_DIR_NAME))
-}
-
-fn resolve_remote_skills_catalog_path(app: &AppHandle) -> Result<PathBuf, String> {
-    Ok(resolve_remote_skills_dir(app)?.join(REMOTE_SKILLS_FILE_NAME))
-}
-
-fn resolve_remote_skills_metadata_path(app: &AppHandle) -> Result<PathBuf, String> {
-    Ok(resolve_remote_skills_dir(app)?.join(REMOTE_SKILLS_METADATA_FILE_NAME))
-}
-
-fn read_cached_skill_catalog_metadata(
-    app: &AppHandle,
-) -> Result<Option<CachedSkillCatalogMetadata>, String> {
-    let path = resolve_remote_skills_metadata_path(app)?;
-    if !path.exists() {
-        return Ok(None);
-    }
-    let text = fs::read_to_string(&path)
-        .map_err(|error| format!("failed to read cached skills metadata: {error}"))?;
-    let metadata = serde_json::from_str(&text)
-        .map_err(|error| format!("failed to parse cached skills metadata: {error}"))?;
-    Ok(Some(metadata))
-}
-
-fn read_active_skill_catalog_impl(app: &AppHandle) -> Result<ActiveSkillCatalogPayload, String> {
-    let metadata = read_cached_skill_catalog_metadata(app)?;
-    let catalog_path = resolve_remote_skills_catalog_path(app)?;
-
-    if let Some(metadata) = metadata {
-        if catalog_path.exists() {
-            let text = fs::read_to_string(&catalog_path)
-                .map_err(|error| format!("failed to read cached skills catalog: {error}"))?;
-            let catalog = serde_json::from_str(&text)
-                .map_err(|error| format!("failed to parse cached skills catalog: {error}"))?;
-            return Ok(ActiveSkillCatalogPayload {
-                version: metadata.version,
-                source: String::from("cached"),
-                catalog,
-            });
-        }
-    }
-
-    read_bundled_skill_catalog()
-}
-
-fn read_remote_notifications_impl(app: &AppHandle) -> Result<RemoteNotificationsPayload, String> {
-    let notifications = read_cached_skill_catalog_metadata(app)?
-        .map(|metadata| metadata.notifications)
-        .unwrap_or_else(empty_cached_notifications);
-
-    Ok(RemoteNotificationsPayload {
-        cn: notifications.cn,
-        en: notifications.en,
-        source: String::from("cached"),
-    })
-}
-
-fn read_remote_desktop_version_impl(
-    app: &AppHandle,
-) -> Result<RemoteDesktopVersionPayload, String> {
-    let current_version = current_desktop_version(app);
-    let remote_version =
-        read_cached_skill_catalog_metadata(app)?.and_then(|metadata| metadata.desktop_version);
-
-    Ok(RemoteDesktopVersionPayload {
-        update_available: is_remote_desktop_version_newer(
-            remote_version.as_deref(),
-            &current_version,
-        ),
-        version: remote_version,
-        source: String::from("cached"),
-    })
-}
-
-fn write_cached_skill_catalog(
-    app: &AppHandle,
-    version: &str,
-    url: &str,
-    desktop_version: Option<&str>,
-    notifications: CachedNotifications,
-    catalog_text: &str,
-) -> Result<(), String> {
-    let dir = resolve_remote_skills_dir(app)?;
-    fs::create_dir_all(&dir)
-        .map_err(|error| format!("failed to create remote skills cache directory: {error}"))?;
-
-    let catalog_value: Value = serde_json::from_str(catalog_text)
-        .map_err(|error| format!("failed to parse downloaded skills catalog: {error}"))?;
-    let metadata = CachedSkillCatalogMetadata {
-        version: String::from(version),
-        url: String::from(url),
-        desktop_version: desktop_version.map(String::from),
-        notifications,
-    };
-
-    fs::write(
-        resolve_remote_skills_catalog_path(app)?,
-        serde_json::to_string(&catalog_value)
-            .map_err(|error| format!("failed to serialize cached skills catalog: {error}"))?,
-    )
-    .map_err(|error| format!("failed to write cached skills catalog: {error}"))?;
-
-    fs::write(
-        resolve_remote_skills_metadata_path(app)?,
-        serde_json::to_string(&metadata)
-            .map_err(|error| format!("failed to serialize cached skills metadata: {error}"))?,
-    )
-    .map_err(|error| format!("failed to write cached skills metadata: {error}"))?;
-
-    Ok(())
-}
-
-fn write_cached_skill_catalog_metadata(
-    app: &AppHandle,
-    version: &str,
-    url: &str,
-    desktop_version: Option<&str>,
-    notifications: CachedNotifications,
-) -> Result<(), String> {
-    let dir = resolve_remote_skills_dir(app)?;
-    fs::create_dir_all(&dir)
-        .map_err(|error| format!("failed to create remote skills cache directory: {error}"))?;
-
-    let metadata = CachedSkillCatalogMetadata {
-        version: String::from(version),
-        url: String::from(url),
-        desktop_version: desktop_version.map(String::from),
-        notifications,
-    };
-
-    fs::write(
-        resolve_remote_skills_metadata_path(app)?,
-        serde_json::to_string(&metadata)
-            .map_err(|error| format!("failed to serialize cached skills metadata: {error}"))?,
-    )
-    .map_err(|error| format!("failed to write cached skills metadata: {error}"))?;
-
-    Ok(())
-}
-
-fn ensure_remote_skill_catalog_fresh_impl(
-    app: &AppHandle,
-) -> Result<SkillCatalogRefreshResult, String> {
-    let active_before = read_active_skill_catalog_impl(app)?;
-    let current_desktop_version = current_desktop_version(app);
-    let cached_desktop_version_before =
-        read_cached_skill_catalog_metadata(app)?.and_then(|metadata| metadata.desktop_version);
-    let desktop_update_available_before = is_remote_desktop_version_newer(
-        cached_desktop_version_before.as_deref(),
-        &current_desktop_version,
-    );
-    let client = Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|error| format!("failed to initialize remote skills client: {error}"))?;
-
-    let manifest_response = match client.get(REMOTE_SKILLS_MANIFEST_URL).send() {
-        Ok(response) => response,
-        Err(error) => {
-            let _ = append_launcher_log(
-                app,
-                "WARN",
-                &format!("remote skills manifest request failed: {error}"),
-            );
-            return Ok(SkillCatalogRefreshResult {
-                version: active_before.version,
-                source: active_before.source,
-                updated: false,
-                desktop_version: cached_desktop_version_before,
-                desktop_update_available: desktop_update_available_before,
-            });
-        }
-    };
-
-    if !manifest_response.status().is_success() {
-        let _ = append_launcher_log(
-            app,
-            "WARN",
-            &format!(
-                "remote skills manifest request failed: HTTP {}",
-                manifest_response.status()
-            ),
-        );
-        return Ok(SkillCatalogRefreshResult {
-            version: active_before.version,
-            source: active_before.source,
-            updated: false,
-            desktop_version: cached_desktop_version_before,
-            desktop_update_available: desktop_update_available_before,
-        });
-    }
-
-    let manifest_text = match manifest_response.text() {
-        Ok(text) => text,
-        Err(error) => {
-            let _ = append_launcher_log(
-                app,
-                "WARN",
-                &format!("failed to read remote skills manifest body: {error}"),
-            );
-            return Ok(SkillCatalogRefreshResult {
-                version: active_before.version,
-                source: active_before.source,
-                updated: false,
-                desktop_version: cached_desktop_version_before,
-                desktop_update_available: desktop_update_available_before,
-            });
-        }
-    };
-
-    let manifest: RemoteManifest = match serde_json::from_str(&manifest_text) {
-        Ok(manifest) => manifest,
-        Err(error) => {
-            let _ = append_launcher_log(
-                app,
-                "WARN",
-                &format!("failed to parse remote skills manifest: {error}"),
-            );
-            return Ok(SkillCatalogRefreshResult {
-                version: active_before.version,
-                source: active_before.source,
-                updated: false,
-                desktop_version: cached_desktop_version_before,
-                desktop_update_available: desktop_update_available_before,
-            });
-        }
-    };
-
-    let remote_desktop_version = manifest
-        .desktop
-        .map(|desktop| desktop.version.trim().to_string())
-        .filter(|version| !version.is_empty());
-    let desktop_update_available = is_remote_desktop_version_newer(
-        remote_desktop_version.as_deref(),
-        &current_desktop_version,
-    );
-
-    let notifications = manifest
-        .notifications
-        .map(|notifications| CachedNotifications {
-            cn: notifications.cn,
-            en: notifications.en,
-        })
-        .unwrap_or_else(empty_cached_notifications);
-
-    let Some(skills_manifest) = manifest.skills else {
-        let _ = append_launcher_log(app, "WARN", "remote skills manifest missing skills section");
-        return Ok(SkillCatalogRefreshResult {
-            version: active_before.version,
-            source: active_before.source,
-            updated: false,
-            desktop_version: remote_desktop_version,
-            desktop_update_available: desktop_update_available,
-        });
-    };
-
-    let remote_version = skills_manifest.version.trim();
-    let remote_url = skills_manifest.url.trim();
-    if remote_version.is_empty() || remote_url.is_empty() {
-        let _ = append_launcher_log(
-            app,
-            "WARN",
-            "remote skills manifest has empty version or URL",
-        );
-        return Ok(SkillCatalogRefreshResult {
-            version: active_before.version,
-            source: active_before.source,
-            updated: false,
-            desktop_version: remote_desktop_version.clone(),
-            desktop_update_available: desktop_update_available,
-        });
-    }
-
-    let needs_update = match is_remote_version_newer(remote_version, &active_before.version) {
-        Ok(value) => value,
-        Err(error) => {
-            let _ = append_launcher_log(
-                app,
-                "WARN",
-                &format!("failed to compare remote skills version: {error}"),
-            );
-            false
-        }
-    };
-
-    if !needs_update {
-        let metadata_version = read_cached_skill_catalog_metadata(app)?
-            .map(|metadata| metadata.version)
-            .unwrap_or_else(|| active_before.version.clone());
-        let metadata_url = read_cached_skill_catalog_metadata(app)?
-            .map(|metadata| metadata.url)
-            .unwrap_or_else(|| String::from(remote_url));
-        let _ = write_cached_skill_catalog_metadata(
-            app,
-            &metadata_version,
-            &metadata_url,
-            remote_desktop_version.as_deref(),
-            notifications,
-        );
-        return Ok(SkillCatalogRefreshResult {
-            version: active_before.version,
-            source: active_before.source,
-            updated: false,
-            desktop_version: remote_desktop_version,
-            desktop_update_available: desktop_update_available,
-        });
-    }
-
-    let skills_response = match client.get(remote_url).send() {
-        Ok(response) => response,
-        Err(error) => {
-            let _ = append_launcher_log(
-                app,
-                "WARN",
-                &format!("remote skills catalog download failed: {error}"),
-            );
-            return Ok(SkillCatalogRefreshResult {
-                version: active_before.version,
-                source: active_before.source,
-                updated: false,
-                desktop_version: remote_desktop_version.clone(),
-                desktop_update_available: desktop_update_available,
-            });
-        }
-    };
-
-    if !skills_response.status().is_success() {
-        let _ = append_launcher_log(
-            app,
-            "WARN",
-            &format!(
-                "remote skills catalog download failed: HTTP {}",
-                skills_response.status()
-            ),
-        );
-        return Ok(SkillCatalogRefreshResult {
-            version: active_before.version,
-            source: active_before.source,
-            updated: false,
-            desktop_version: remote_desktop_version.clone(),
-            desktop_update_available: desktop_update_available,
-        });
-    }
-
-    let catalog_text = match skills_response.text() {
-        Ok(text) => text,
-        Err(error) => {
-            let _ = append_launcher_log(
-                app,
-                "WARN",
-                &format!("failed to read remote skills catalog body: {error}"),
-            );
-            return Ok(SkillCatalogRefreshResult {
-                version: active_before.version,
-                source: active_before.source,
-                updated: false,
-                desktop_version: remote_desktop_version.clone(),
-                desktop_update_available: desktop_update_available,
-            });
-        }
-    };
-
-    if let Err(error) = write_cached_skill_catalog(
-        app,
-        remote_version,
-        remote_url,
-        remote_desktop_version.as_deref(),
-        notifications,
-        &catalog_text,
-    ) {
-        let _ = append_launcher_log(
-            app,
-            "WARN",
-            &format!("failed to persist remote skills catalog: {error}"),
-        );
-        return Ok(SkillCatalogRefreshResult {
-            version: active_before.version,
-            source: active_before.source,
-            updated: false,
-            desktop_version: remote_desktop_version,
-            desktop_update_available: desktop_update_available,
-        });
-    }
-
-    let active_after = read_active_skill_catalog_impl(app)?;
-    let _ = append_launcher_log(
-        app,
-        "INFO",
-        &format!(
-            "remote skills catalog updated to version {}",
-            active_after.version
-        ),
-    );
-
-    Ok(SkillCatalogRefreshResult {
-        version: active_after.version,
-        source: active_after.source,
-        updated: true,
-        desktop_version: read_cached_skill_catalog_metadata(app)?
-            .and_then(|metadata| metadata.desktop_version),
-        desktop_update_available: read_remote_desktop_version_impl(app)?.update_available,
-    })
 }
 
 fn read_setup_info_impl(app: &AppHandle) -> Result<SetupInfo, String> {
@@ -5827,6 +5404,332 @@ fn apply_initial_qq_channel_config(
     Ok(())
 }
 
+fn apply_initial_weixin_channel_config(root: &mut Map<String, Value>) -> Result<(), String> {
+    let channels = root
+        .entry(String::from("channels"))
+        .or_insert_with(|| Value::Object(Map::new()));
+    let channels_obj = channels
+        .as_object_mut()
+        .ok_or_else(|| String::from("channels config must be an object"))?;
+    let weixin = channels_obj
+        .entry(String::from(WEIXIN_CHANNEL_ID))
+        .or_insert_with(|| Value::Object(Map::new()));
+    let weixin_obj = weixin
+        .as_object_mut()
+        .ok_or_else(|| String::from("weixin channel config must be an object"))?;
+    weixin_obj.insert(String::from("enabled"), Value::Bool(true));
+
+    let plugins = root
+        .entry(String::from("plugins"))
+        .or_insert_with(|| Value::Object(Map::new()));
+    let plugins_obj = plugins
+        .as_object_mut()
+        .ok_or_else(|| String::from("plugins config must be an object"))?;
+    let entries = plugins_obj
+        .entry(String::from("entries"))
+        .or_insert_with(|| Value::Object(Map::new()));
+    let entries_obj = entries
+        .as_object_mut()
+        .ok_or_else(|| String::from("plugins.entries config must be an object"))?;
+    let entry = entries_obj
+        .entry(String::from(WEIXIN_CHANNEL_ID))
+        .or_insert_with(|| Value::Object(Map::new()));
+    let entry_obj = entry
+        .as_object_mut()
+        .ok_or_else(|| String::from("weixin plugin entry must be an object"))?;
+    entry_obj.insert(String::from("enabled"), Value::Bool(true));
+
+    Ok(())
+}
+
+fn start_initial_weixin_login_impl(
+    app: &AppHandle,
+    pending: &Arc<Mutex<HashMap<String, Receiver<Result<InitialWeixinLoginWaitResult, String>>>>>,
+) -> Result<InitialWeixinLoginStartResult, String> {
+    let engine_dir = resolve_engine_dir(app)?;
+    let node_binary = resolve_node_binary(&engine_dir)?;
+    let entry_script = resolve_openclaw_entry(&engine_dir)?;
+    let openclaw_package_root = resolve_openclaw_package_root(&entry_script)?;
+    let openclaw_home = initialize_openclaw_home(app, &engine_dir)?;
+    let tmp_dir = initialize_openclaw_tmp_dir(&openclaw_home)?;
+    let npm_cache_dir = resolve_npm_cache_dir(&openclaw_home);
+    let npm_prefix_dir = resolve_npm_prefix_dir(&openclaw_home);
+    let corepack_home_dir = resolve_corepack_home_dir(&openclaw_home);
+    let config_path = openclaw_home.join("openclaw.json");
+
+    let weixin_plugin_dir = openclaw_package_root
+        .join("dist")
+        .join("extensions")
+        .join(WEIXIN_CHANNEL_ID);
+    if !weixin_plugin_dir.exists() {
+        return Err(format!(
+            "bundled WeChat plugin was not found at {}",
+            weixin_plugin_dir.display()
+        ));
+    }
+
+    let script_path = tmp_dir.join("whereclaw-weixin-login.mjs");
+    let dist_dir = openclaw_package_root.join("dist");
+    let (config_module_path, config_exports) = resolve_dist_module_path_with_exports(
+        &dist_dir,
+        "config-",
+        &["loadConfig", "readConfigFileSnapshot", "replaceConfigFile"],
+    )?;
+    let (channel_resolution_module_path, channel_resolution_exports) =
+        resolve_dist_module_path_with_exports(
+            &dist_dir,
+            "channel-plugin-resolution-",
+            &["resolveInstallableChannelPlugin"],
+        )?;
+    let (runtime_module_path, runtime_exports) = resolve_dist_module_path_with_exports(
+        &dist_dir,
+        "runtime-",
+        &["defaultRuntime"],
+    )?;
+    let (auto_enable_module_path, auto_enable_exports) = resolve_dist_module_path_with_exports(
+        &dist_dir,
+        "plugin-auto-enable-",
+        &["applyPluginAutoEnable"],
+    )?;
+    let config_module_url = Url::from_file_path(config_module_path)
+        .map_err(|_| String::from("failed to build config module URL"))?;
+    let channel_resolution_module_url = Url::from_file_path(channel_resolution_module_path)
+        .map_err(|_| String::from("failed to build channel resolution module URL"))?;
+    let runtime_module_url = Url::from_file_path(runtime_module_path)
+        .map_err(|_| String::from("failed to build runtime module URL"))?;
+    let auto_enable_module_url = Url::from_file_path(auto_enable_module_path)
+    .map_err(|_| String::from("failed to build plugin auto-enable module URL"))?;
+
+    let script = build_initial_weixin_login_helper_script(
+        config_module_url.as_str(),
+        &config_exports[0],
+        &config_exports[1],
+        &config_exports[2],
+        channel_resolution_module_url.as_str(),
+        &channel_resolution_exports[0],
+        runtime_module_url.as_str(),
+        &runtime_exports[0],
+        auto_enable_module_url.as_str(),
+        &auto_enable_exports[0],
+        WEIXIN_CHANNEL_ID,
+    );
+    fs::write(&script_path, script)
+        .map_err(|error| format!("failed to write weixin login helper script: {error}"))?;
+
+    let mut command = Command::new(&node_binary);
+    command
+        .arg(&script_path)
+        .current_dir(&openclaw_package_root)
+        .env("OPENCLAW_HOME", &openclaw_home)
+        .env("OPENCLAW_STATE_DIR", &openclaw_home)
+        .env("OPENCLAW_CONFIG_PATH", &config_path)
+        .env("TMPDIR", &tmp_dir)
+        .env("NPM_CONFIG_CACHE", &npm_cache_dir)
+        .env("npm_config_cache", &npm_cache_dir)
+        .env("NPM_CONFIG_PREFIX", &npm_prefix_dir)
+        .env("npm_config_prefix", &npm_prefix_dir)
+        .env("COREPACK_HOME", &corepack_home_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("failed to start WeChat login helper: {error}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| String::from("WeChat login helper stdout was not available"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| String::from("WeChat login helper stderr was not available"))?;
+    let stderr_buffer = Arc::new(Mutex::new(String::new()));
+    let stderr_target = stderr_buffer.clone();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stderr);
+        let mut captured = String::new();
+        let _ = reader.read_to_string(&mut captured);
+        if let Ok(mut slot) = stderr_target.lock() {
+            *slot = captured;
+        }
+    });
+
+    let mut lines = BufReader::new(stdout).lines();
+    let start_payload = loop {
+        let Some(line_result) = lines.next() else {
+            let _ = child.wait();
+            let stderr_message = stderr_buffer
+                .lock()
+                .map(|value| value.clone())
+                .unwrap_or_default();
+            return Err(format!(
+                "WeChat login helper exited before returning a QR code. {}",
+                stderr_message.trim()
+            ));
+        };
+        let line = line_result
+            .map_err(|error| format!("failed reading WeChat login helper stdout: {error}"))?;
+        let Ok(payload) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if payload.get("phase").and_then(Value::as_str) == Some("start") {
+            break payload;
+        }
+    };
+
+    let session_key = start_payload
+        .get("sessionKey")
+        .and_then(Value::as_str)
+        .ok_or_else(|| String::from("weixin login did not return a session key"))?
+        .to_string();
+    let (sender, receiver) = mpsc::channel();
+    let stderr_for_wait = stderr_buffer.clone();
+    thread::spawn(move || {
+        let mut wait_payload = None;
+        for line_result in lines {
+            match line_result {
+                Ok(line) => {
+                    if let Ok(payload) = serde_json::from_str::<Value>(&line) {
+                        if payload.get("phase").and_then(Value::as_str) == Some("wait") {
+                            wait_payload = Some(payload);
+                            break;
+                        }
+                    }
+                }
+                Err(error) => {
+                    let _ = sender.send(Err(format!(
+                        "failed reading WeChat login helper stdout: {error}"
+                    )));
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return;
+                }
+            }
+        }
+
+        let status = child.wait();
+        let final_result = match wait_payload {
+            Some(payload) => Ok(InitialWeixinLoginWaitResult {
+                connected: payload
+                    .get("connected")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                message: payload
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("WeChat login did not complete.")
+                    .to_string(),
+                account_id: payload
+                    .get("accountId")
+                    .and_then(Value::as_str)
+                    .map(String::from),
+            }),
+            None => {
+                let stderr_message = stderr_for_wait
+                    .lock()
+                    .map(|value| value.clone())
+                    .unwrap_or_default();
+                Err(format!(
+                    "WeChat login helper exited before returning a completion result. status={:?} stderr={}",
+                    status.ok(),
+                    stderr_message.trim()
+                ))
+            }
+        };
+        let _ = sender.send(final_result);
+    });
+    pending
+        .lock()
+        .map_err(|_| String::from("failed to acquire WeChat login state lock"))?
+        .insert(session_key.clone(), receiver);
+
+    Ok(InitialWeixinLoginStartResult {
+        qr_data_url: start_payload
+            .get("qrDataUrl")
+            .and_then(Value::as_str)
+            .map(String::from),
+        message: start_payload
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("WeChat QR code generated.")
+            .to_string(),
+        session_key,
+    })
+}
+
+fn wait_for_initial_weixin_login_impl(
+    pending: &Arc<Mutex<HashMap<String, Receiver<Result<InitialWeixinLoginWaitResult, String>>>>>,
+    session_key: &str,
+) -> Result<InitialWeixinLoginWaitResult, String> {
+    let receiver = pending
+        .lock()
+        .map_err(|_| String::from("failed to acquire WeChat login state lock"))?
+        .remove(session_key)
+        .ok_or_else(|| String::from("No in-progress WeChat login was found for this session."))?;
+
+    receiver
+        .recv()
+        .map_err(|error| format!("failed waiting for WeChat login result: {error}"))?
+}
+
+fn build_initial_weixin_login_helper_script(
+    config_module_url: &str,
+    load_config_export: &str,
+    read_config_snapshot_export: &str,
+    replace_config_file_export: &str,
+    channel_resolution_module_url: &str,
+    resolve_channel_plugin_export: &str,
+    runtime_module_url: &str,
+    default_runtime_export: &str,
+    auto_enable_module_url: &str,
+    apply_plugin_auto_enable_export: &str,
+    channel_id: &str,
+) -> String {
+    format!(
+        "import {{ {load_config_export} as loadConfig, {read_config_snapshot_export} as readConfigFileSnapshot, {replace_config_file_export} as replaceConfigFile }} from {config_module:?};\n\
+import {{ {resolve_channel_plugin_export} as resolveInstallableChannelPlugin }} from {channel_module:?};\n\
+import {{ {default_runtime_export} as defaultRuntime }} from {runtime_module:?};\n\
+import {{ {apply_plugin_auto_enable_export} as applyPluginAutoEnable }} from {auto_enable_module:?};\n\
+const sourceSnapshotPromise = readConfigFileSnapshot().catch(() => null);\n\
+const autoEnabled = applyPluginAutoEnable({{ config: loadConfig(), env: process.env }});\n\
+const loadedCfg = autoEnabled.config;\n\
+const resolved = await resolveInstallableChannelPlugin({{\n\
+  cfg: loadedCfg,\n\
+  runtime: defaultRuntime,\n\
+  rawChannel: {channel_id:?},\n\
+  channelId: {channel_id:?},\n\
+  allowInstall: true,\n\
+  supports: (candidate) => Boolean(candidate.gateway?.loginWithQrStart) && Boolean(candidate.gateway?.loginWithQrWait),\n\
+}});\n\
+if (autoEnabled.changes.length > 0 || resolved.configChanged) {{\n\
+  await replaceConfigFile({{ nextConfig: resolved.cfg, baseHash: (await sourceSnapshotPromise)?.hash }});\n\
+}}\n\
+if (!resolved.plugin?.gateway?.loginWithQrStart || !resolved.plugin.gateway.loginWithQrWait) throw new Error('WeChat plugin login helpers are unavailable');\n\
+const startResult = await resolved.plugin.gateway.loginWithQrStart({{ force: true, timeoutMs: 10000, verbose: false }});\n\
+process.stdout.write(`${{JSON.stringify({{ phase: 'start', ...startResult }})}}\\n`);\n\
+const originalStdoutWrite = process.stdout.write.bind(process.stdout);\n\
+process.stdout.write = () => true;\n\
+try {{\n\
+  const waitResult = await resolved.plugin.gateway.loginWithQrWait({{ sessionKey: startResult.sessionKey, timeoutMs: 480000 }});\n\
+  process.stdout.write = originalStdoutWrite;\n\
+  process.stdout.write(`${{JSON.stringify({{ phase: 'wait', ...waitResult }})}}\\n`);\n\
+}} finally {{\n\
+  process.stdout.write = originalStdoutWrite;\n\
+}}\n",
+        config_module = config_module_url,
+        load_config_export = load_config_export,
+        read_config_snapshot_export = read_config_snapshot_export,
+        replace_config_file_export = replace_config_file_export,
+        channel_module = channel_resolution_module_url,
+        resolve_channel_plugin_export = resolve_channel_plugin_export,
+        runtime_module = runtime_module_url,
+        default_runtime_export = default_runtime_export,
+        auto_enable_module = auto_enable_module_url,
+        apply_plugin_auto_enable_export = apply_plugin_auto_enable_export,
+        channel_id = channel_id,
+    )
+}
+
 fn matches_channel_plugin_id(plugin_id: &str, channel: &str) -> bool {
     plugin_id == channel
         || plugin_id
@@ -6442,6 +6345,9 @@ pub fn run() {
         .manage(ExitIntentState {
             quitting: AtomicBool::new(false),
         })
+        .manage(InitialWeixinLoginState {
+            pending: Arc::new(Mutex::new(HashMap::new())),
+        })
         .on_window_event(|window, event| {
             if window.label() != "main" {
                 return;
@@ -6490,15 +6396,14 @@ pub fn run() {
             open_model_provider_add_wizard,
             open_model_add_wizard,
             read_setup_info,
+            read_bundled_openclaw_version_command,
             read_launcher_preferences,
-            ensure_remote_skill_catalog_fresh,
-            read_active_skill_catalog,
-            read_remote_notifications,
-            read_remote_desktop_version,
             save_launcher_preferences,
             reset_launcher_state,
             reset_openclaw_config,
             apply_initial_setup_config,
+            start_initial_weixin_login,
+            wait_for_initial_weixin_login,
             list_channel_accounts,
             remove_channel_account,
             read_launcher_logs,
@@ -6544,46 +6449,21 @@ mod tests {
     use serde_json::{Map, Value};
 
     use super::{
-        apply_initial_qq_channel_config, build_clawhub_install_args,
+        apply_initial_qq_channel_config, apply_initial_weixin_channel_config,
+        build_clawhub_install_args, build_initial_weixin_login_helper_script,
         build_whereclaw_terminal_node_cli_wrapper_script,
         build_whereclaw_terminal_ollama_wrapper_script, build_whereclaw_terminal_shell_rc,
         build_whereclaw_terminal_windows_script, clawhub_marketplace_initialization_script,
         clawhub_marketplace_title_for_language, clawhub_marketplace_url_for_language,
         clawhub_skill_id_from_url, clawhub_skill_install_dir_exists, ensure_object,
-        is_remote_desktop_version_newer, is_remote_version_newer,
-        normalize_ollama_model_name_for_lookup, repair_plugin_load_paths, resolve_openclaw_entry,
-        CachedSkillCatalogMetadata, CLAWHUB_CN_MARKETPLACE_URL, CLAWHUB_CN_WINDOW_TITLE,
+        control_ui_window_initialization_script, normalize_ollama_model_name_for_lookup,
+        read_bundled_openclaw_version_from_package_root, repair_plugin_load_paths,
+        resolve_dist_hashed_module_path, resolve_dist_module_export_alias,
+        resolve_openclaw_entry,
+        CLAWHUB_CN_MARKETPLACE_URL, CLAWHUB_CN_WINDOW_TITLE,
         CLAWHUB_EN_MARKETPLACE_URL, CLAWHUB_EN_WINDOW_TITLE, CLAWHUB_INSTALL_REGISTRY,
         CLAWHUB_STATUS_COMMAND, HEALTH_CHECK_ATTEMPTS, HEALTH_CHECK_DELAY_MS, OLLAMA_HOST,
     };
-
-    #[test]
-    fn semver_comparison_detects_newer_remote_skills_versions() {
-        assert_eq!(is_remote_version_newer("1.0.2", "1.0.1"), Ok(true));
-        assert_eq!(is_remote_version_newer("1.0.1", "1.0.1"), Ok(false));
-        assert_eq!(is_remote_version_newer("1.0.0", "1.0.1"), Ok(false));
-    }
-
-    #[test]
-    fn cached_skill_metadata_defaults_notifications_for_old_schema() {
-        let metadata: CachedSkillCatalogMetadata = serde_json::from_str(
-            r#"{"version":"1.0.2","url":"https://r2.tolearn.cc/skills.json"}"#,
-        )
-        .expect("old metadata schema should still parse");
-
-        assert_eq!(metadata.desktop_version, None);
-        assert!(metadata.notifications.cn.is_empty());
-        assert!(metadata.notifications.en.is_empty());
-    }
-
-    #[test]
-    fn desktop_update_detection_requires_newer_valid_semver() {
-        assert!(is_remote_desktop_version_newer(Some("1.0.1"), "1.0.0"));
-        assert!(!is_remote_desktop_version_newer(Some("1.0.0"), "1.0.0"));
-        assert!(!is_remote_desktop_version_newer(Some(""), "1.0.0"));
-        assert!(!is_remote_desktop_version_newer(None, "1.0.0"));
-        assert!(!is_remote_desktop_version_newer(Some("latest"), "1.0.0"));
-    }
 
     #[test]
     fn chooses_clawhub_marketplace_by_language() {
@@ -6603,6 +6483,17 @@ mod tests {
             clawhub_marketplace_title_for_language("en"),
             CLAWHUB_EN_WINDOW_TITLE
         );
+    }
+
+    #[test]
+    fn control_ui_initialization_script_does_not_override_openclaw_locale() {
+        let script = control_ui_window_initialization_script("zh-CN")
+            .expect("control ui initialization script should render");
+
+        assert!(script.contains("const __WHERECLAW_LOCALE__ = \"zh-CN\";"));
+        assert!(!script.contains("openclaw.i18n.locale"));
+        assert!(!script.contains("LOCALE_RELOAD_KEY"));
+        assert!(!script.contains("window.location.replace(window.location.href);"));
     }
 
     #[test]
@@ -6819,6 +6710,42 @@ mod tests {
     }
 
     #[test]
+    fn reads_bundled_openclaw_version_from_package_json() {
+        let unique = format!(
+            "whereclaw-openclaw-version-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time should be after unix epoch")
+                .as_nanos()
+        );
+        let temp_root = std::env::temp_dir().join(unique);
+        let package_root = temp_root
+            .join("openclaw")
+            .join("node_modules")
+            .join("openclaw");
+        let package_json_path = package_root.join("package.json");
+
+        fs::create_dir_all(&package_root).expect("should create OpenClaw package directory");
+        fs::write(
+            &package_json_path,
+            r#"{
+  "name": "openclaw",
+  "version": "2.3.4"
+}
+"#,
+        )
+        .expect("should write OpenClaw package.json");
+
+        let version = read_bundled_openclaw_version_from_package_root(&package_root)
+            .expect("should read OpenClaw version");
+
+        assert_eq!(version, "2.3.4");
+
+        let _ = fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
     fn initial_qq_channel_config_uses_official_bundled_plugin_schema() {
         let mut root = Map::new();
 
@@ -6849,6 +6776,99 @@ mod tests {
             !root.contains_key("plugins"),
             "official bundled qqbot plugin should not be overridden by config plugin"
         );
+    }
+
+    #[test]
+    fn initial_weixin_channel_config_enables_bundled_plugin_entry() {
+        let mut root = Map::new();
+
+        apply_initial_weixin_channel_config(&mut root)
+            .expect("should enable bundled weixin plugin config");
+
+        let weixin = root
+            .get("channels")
+            .and_then(Value::as_object)
+            .and_then(|channels| channels.get("openclaw-weixin"))
+            .and_then(Value::as_object)
+            .expect("weixin channel config should be present");
+        assert_eq!(weixin.get("enabled"), Some(&Value::Bool(true)));
+
+        let plugin_entry = root
+            .get("plugins")
+            .and_then(Value::as_object)
+            .and_then(|plugins| plugins.get("entries"))
+            .and_then(Value::as_object)
+            .and_then(|entries| entries.get("openclaw-weixin"))
+            .and_then(Value::as_object)
+            .expect("weixin plugin entry should be present");
+        assert_eq!(plugin_entry.get("enabled"), Some(&Value::Bool(true)));
+    }
+
+    #[test]
+    fn weixin_login_helper_script_uses_single_process_start_and_wait_flow() {
+        let script = build_initial_weixin_login_helper_script(
+            "file:///config.js",
+            "loadConfig",
+            "readConfigFileSnapshot",
+            "replaceConfigFile",
+            "file:///channel-resolution.js",
+            "resolveInstallableChannelPlugin",
+            "file:///runtime.js",
+            "defaultRuntime",
+            "file:///auto-enable.js",
+            "applyPluginAutoEnable",
+            "openclaw-weixin",
+        );
+
+        assert!(script.contains("loginWithQrStart"));
+        assert!(script.contains("loginWithQrWait"));
+        assert!(script.contains("phase: 'start'"));
+        assert!(script.contains("phase: 'wait'"));
+        assert!(script.contains("process.stdout.write = () => true;"));
+        assert!(script.contains("import { loadConfig as loadConfig, readConfigFileSnapshot as readConfigFileSnapshot, replaceConfigFile as replaceConfigFile }"));
+    }
+
+    #[test]
+    fn resolves_current_openclaw_dist_module_by_prefix() {
+        let unique = format!(
+            "whereclaw-dist-module-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time should be after unix epoch")
+                .as_nanos()
+        );
+        let temp_root = std::env::temp_dir().join(unique);
+        let dist_dir = temp_root.join("dist");
+        fs::create_dir_all(&dist_dir).expect("should create dist dir");
+        let expected = dist_dir.join("channel-plugin-resolution-NewHash.js");
+        fs::write(&expected, "export {};\n").expect("should write module");
+
+        let resolved = resolve_dist_hashed_module_path(&dist_dir, "channel-plugin-resolution-")
+            .expect("should resolve hashed module");
+
+        assert_eq!(resolved, expected);
+
+        let _ = fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn resolves_export_alias_from_openclaw_module_source() {
+        let source = "const value = 1;\nexport { loadConfig as a, readConfigFileSnapshot as l, replaceConfigFile as r };\n";
+
+        assert_eq!(
+            resolve_dist_module_export_alias(source, "loadConfig"),
+            Some(String::from("a"))
+        );
+        assert_eq!(
+            resolve_dist_module_export_alias(source, "readConfigFileSnapshot"),
+            Some(String::from("l"))
+        );
+        assert_eq!(
+            resolve_dist_module_export_alias(source, "replaceConfigFile"),
+            Some(String::from("r"))
+        );
+        assert_eq!(resolve_dist_module_export_alias(source, "missing"), None);
     }
 
     #[test]

@@ -1,5 +1,6 @@
 param(
-  [string]$NodeVersion = "22.20.0"
+  [string]$NodeVersion = "22.20.0",
+  [string]$WeixinChannelPluginSpec = "@tencent-weixin/openclaw-weixin@latest"
 )
 
 $ErrorActionPreference = "Stop"
@@ -226,6 +227,77 @@ function Install-OptionalChannelPluginDependencies {
   }
 }
 
+function Install-BundledWeixinPlugin {
+  $ExtensionsRoot = Join-Path $EngineDir "openclaw\node_modules\openclaw\dist\extensions"
+  $PluginRoot = Join-Path $ExtensionsRoot "openclaw-weixin"
+  $PackRoot = Join-Path $TempDir "openclaw-weixin-pack"
+  $ExtractRoot = Join-Path $TempDir "openclaw-weixin-extract"
+
+  New-Item -ItemType Directory -Force -Path $ExtensionsRoot | Out-Null
+  New-Item -ItemType Directory -Force -Path $PackRoot | Out-Null
+  New-Item -ItemType Directory -Force -Path $ExtractRoot | Out-Null
+
+  Write-Host "Bundling WeChat plugin $WeixinChannelPluginSpec..."
+  $OriginalLocation = Get-Location
+  $OriginalPath = $env:Path
+  $OriginalNpmConfigCache = $env:NPM_CONFIG_CACHE
+  $OriginalLowerNpmConfigCache = $env:npm_config_cache
+  try {
+    Set-Location $PackRoot
+    $env:Path = "$NodeRuntimeDir;$OriginalPath"
+    $env:NPM_CONFIG_CACHE = $NpmCacheDir
+    $env:npm_config_cache = $NpmCacheDir
+    $TarballName = (& $NpmCmd pack $WeixinChannelPluginSpec --silent | Select-Object -Last 1).Trim()
+    if ([string]::IsNullOrWhiteSpace($TarballName)) {
+      throw "npm pack did not return a tarball name."
+    }
+  }
+  finally {
+    Set-Location $OriginalLocation
+    $env:Path = $OriginalPath
+    $env:NPM_CONFIG_CACHE = $OriginalNpmConfigCache
+    $env:npm_config_cache = $OriginalLowerNpmConfigCache
+  }
+
+  $TarballPath = Join-Path $PackRoot $TarballName
+  if (-not (Test-Path $TarballPath)) {
+    throw "Bundled WeChat plugin tarball was not created."
+  }
+
+  tar -xzf $TarballPath -C $ExtractRoot
+
+  Remove-DirectoryIfExists $PluginRoot
+  New-Item -ItemType Directory -Force -Path $PluginRoot | Out-Null
+  Copy-Item -Recurse -Force (Join-Path $ExtractRoot "package\*") $PluginRoot
+
+  Write-Host "Installing bundled plugin dependencies for openclaw-weixin..."
+  $OriginalPath = $env:Path
+  $OriginalNpmConfigCache = $env:NPM_CONFIG_CACHE
+  $OriginalLowerNpmConfigCache = $env:npm_config_cache
+  try {
+    $env:Path = "$NodeRuntimeDir;$OriginalPath"
+    $env:NPM_CONFIG_CACHE = $NpmCacheDir
+    $env:npm_config_cache = $NpmCacheDir
+    & $NpmCmd install --prefix $PluginRoot --no-audit --no-fund --omit=dev
+    if ($LASTEXITCODE -ne 0) {
+      throw "npm install exited with code $LASTEXITCODE"
+    }
+
+    Remove-UnsafePluginLocalLinks -PluginRoot $PluginRoot
+  }
+  finally {
+    $env:Path = $OriginalPath
+    $env:NPM_CONFIG_CACHE = $OriginalNpmConfigCache
+    $env:npm_config_cache = $OriginalLowerNpmConfigCache
+  }
+
+  Write-Host "Compiling bundled WeChat plugin to JavaScript..."
+  & $NodeExe (Join-Path $RootDir "scripts\compile-bundled-weixin-plugin.mjs") $PluginRoot
+  if ($LASTEXITCODE -ne 0) {
+    throw "Bundled WeChat plugin compile failed with code $LASTEXITCODE"
+  }
+}
+
 function Get-OllamaPlatformDir {
   switch (Get-WindowsArchitecture) {
     "ARM64" { return "windows-arm64" }
@@ -375,6 +447,7 @@ try {
   Remove-DirectoryIfExists $RuntimeUiDir
   Copy-Item -Recurse -Force (Join-Path $EngineDir "openclaw\node_modules\openclaw\dist\control-ui") $RuntimeUiDir
 
+  Install-BundledWeixinPlugin
   Install-OptionalChannelPluginDependencies
 
   $TemplatePath = Join-Path $EngineDir "templates\openclaw.json"

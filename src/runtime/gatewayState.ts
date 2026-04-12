@@ -92,9 +92,7 @@ export type GatewayStatusCardState = {
   showDownloadHintInCard: boolean;
 };
 
-export function getGatewayStatusCardState(
-  _input: GatewayStartStateInput,
-): GatewayStatusCardState {
+export function getGatewayStatusCardState(): GatewayStatusCardState {
   return {
     showDownloadHintInCard: false,
   };

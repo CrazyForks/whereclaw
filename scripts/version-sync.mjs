@@ -41,17 +41,12 @@ function createPaths(rootDir) {
     packageLock: resolve(root, 'package-lock.json'),
     tauriConfig: resolve(root, 'src-tauri/tauri.conf.json'),
     cargoToml: resolve(root, 'src-tauri/Cargo.toml'),
-    skillsCatalog: resolve(root, 'skills.json'),
   };
 }
 
 function ensureManifestShape(manifest) {
   return {
     appVersion: normalizeVersion(manifest.appVersion, 'manifest.appVersion'),
-    skillsCatalogVersion: normalizeVersion(
-      manifest.skillsCatalogVersion,
-      'manifest.skillsCatalogVersion',
-    ),
   };
 }
 
@@ -76,15 +71,10 @@ export async function syncVersionFiles({
       packageJson.version,
       'package.json version',
     );
-    const existingSkillsCatalogVersion = normalizeVersion(
-      manifest?.skillsCatalogVersion ?? packageVersion,
-      'skills catalog version',
-    );
 
     manifest = {
       ...(manifest && typeof manifest === 'object' ? manifest : {}),
       appVersion: packageVersion,
-      skillsCatalogVersion: existingSkillsCatalogVersion,
     };
 
     if (!check) {
@@ -103,7 +93,6 @@ export async function syncVersionFiles({
     : null;
   const tauriConfig = readJson(paths.tauriConfig);
   const cargoToml = readFileSync(paths.cargoToml, 'utf8');
-  const skillsCatalog = readJson(paths.skillsCatalog);
 
   if (check) {
     const cargoVersion = cargoToml.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
@@ -141,12 +130,6 @@ export async function syncVersionFiles({
       cargoVersion,
       normalizedManifest.appVersion,
     );
-    compareValue(
-      mismatches,
-      'skills.json version field',
-      Object.prototype.hasOwnProperty.call(skillsCatalog, 'version'),
-      false,
-    );
 
     return { ok: mismatches.length === 0, mismatches, manifest: normalizedManifest };
   }
@@ -170,9 +153,6 @@ export async function syncVersionFiles({
     replaceCargoVersion(cargoToml, normalizedManifest.appVersion),
   );
 
-  delete skillsCatalog.version;
-  writeJson(paths.skillsCatalog, skillsCatalog, 0);
-
   return { ok: true, mismatches: [], manifest: normalizedManifest };
 }
 
@@ -185,9 +165,7 @@ async function main() {
   });
 
   if (!args.has('--check')) {
-    console.log(
-      `Synchronized app version ${result.manifest.appVersion} and skills catalog version ${result.manifest.skillsCatalogVersion}.`,
-    );
+    console.log(`Synchronized app version ${result.manifest.appVersion}.`);
     return;
   }
 
@@ -199,9 +177,7 @@ async function main() {
     return;
   }
 
-  console.log(
-    `Version files match manifest: app=${result.manifest.appVersion}, skills=${result.manifest.skillsCatalogVersion}`,
-  );
+  console.log(`Version files match manifest: app=${result.manifest.appVersion}`);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

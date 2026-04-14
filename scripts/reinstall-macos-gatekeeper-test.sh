@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-DMG_PATH="${1:-/Users/fc/Documents/GitHub/whereclaw/release-artifacts/macos-arm64/WhereClaw_1.0.0_aarch64.dmg}"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DEFAULT_DMG_PATH="$(node "$ROOT_DIR/scripts/package-version.mjs" macos-dmg-path macos-arm64 aarch64 local)"
+DMG_PATH="${1:-$DEFAULT_DMG_PATH}"
 APP_NAME="WhereClaw.app"
 APP_BUNDLE_ID="com.whereclaw.desktop"
 APP_DEST="/Applications/$APP_NAME"

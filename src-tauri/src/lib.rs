@@ -62,6 +62,74 @@ const TRAY_MENU_SHOW_ID: &str = "tray_show";
 const TRAY_MENU_QUIT_ID: &str = "tray_quit";
 const WEIXIN_CHANNEL_ID: &str = "openclaw-weixin";
 
+fn tray_icon_file_name_for_target(target_os: &str) -> Option<&'static str> {
+    match target_os {
+        "macos" => Some("tray-icon-macos.png"),
+        "windows" => Some("tray-icon-windows.png"),
+        _ => None,
+    }
+}
+
+fn load_platform_tray_icon() -> Result<Option<Image<'static>>, String> {
+    let Some(file_name) = tray_icon_file_name_for_target(env::consts::OS) else {
+        return Ok(None);
+    };
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("icons")
+        .join(file_name);
+    let bytes =
+        fs::read(&path).map_err(|error| format!("failed to read tray icon {}: {error}", path.display()))?;
+    let decoded = image::load_from_memory(&bytes)
+        .map_err(|error| format!("failed to decode tray icon {}: {error}", path.display()))?;
+    let rgba = decoded.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    Ok(Some(Image::new_owned(rgba.into_raw(), width, height)))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum BuildVariant {
+    Local,
+    Cloud,
+}
+
+impl BuildVariant {
+    fn from_env(raw: Option<&str>) -> Self {
+        match raw
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("local")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "cloud" => Self::Cloud,
+            _ => Self::Local,
+        }
+    }
+
+    fn supports_local_models(self) -> bool {
+        matches!(self, Self::Local)
+    }
+}
+
+fn current_build_variant() -> BuildVariant {
+    BuildVariant::from_env(option_env!("WHERECLAW_BUILD_VARIANT_COMPILED"))
+}
+
+fn ensure_local_model_support() -> Result<(), String> {
+    ensure_local_model_support_for(current_build_variant())
+}
+
+fn ensure_local_model_support_for(build_variant: BuildVariant) -> Result<(), String> {
+    if build_variant.supports_local_models() {
+        Ok(())
+    } else {
+        Err(String::from(
+            "local models are not available in the cloud build",
+        ))
+    }
+}
+
 enum GatewayChild {
     Pty {
         child: Box<dyn PtyChild + Send>,
@@ -172,7 +240,13 @@ fn install_tray(app: &AppHandle) -> Result<(), String> {
         .map_err(|error| format!("failed to create tray menu: {error}"))?;
 
     let mut tray_builder = TrayIconBuilder::with_id(TRAY_ICON_ID).menu(&menu);
-    if let Some(icon) = app.default_window_icon().cloned() {
+    if let Some(icon) = load_platform_tray_icon()? {
+        tray_builder = tray_builder.icon(icon);
+        #[cfg(target_os = "macos")]
+        {
+            tray_builder = tray_builder.icon_as_template(true);
+        }
+    } else if let Some(icon) = app.default_window_icon().cloned() {
         tray_builder = tray_builder.icon(Image::new(icon.rgba(), icon.width(), icon.height()));
     }
 
@@ -266,6 +340,8 @@ struct GatewayStatus {
 #[serde(rename_all = "camelCase")]
 struct SetupInfo {
     configured: bool,
+    build_variant: BuildVariant,
+    supports_local_models: bool,
     openclaw_home: String,
     config_path: String,
     current_model_ref: String,
@@ -552,8 +628,17 @@ enum InitialChannelSelection {
 #[serde(rename_all = "camelCase")]
 struct InitialSetupConfigRequest {
     local_model: Option<String>,
+    cloud_model: Option<InitialCloudModelConfig>,
     channel_selection: Option<InitialChannelSelection>,
     qq: Option<InitialQqChannelConfig>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InitialCloudModelConfig {
+    base_url: String,
+    api_key: String,
+    model: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -693,6 +778,7 @@ async fn start_ollama(
     app: AppHandle,
     state: tauri::State<'_, OllamaState>,
 ) -> Result<OllamaStatus, String> {
+    ensure_local_model_support()?;
     let app = app.clone();
     let child = state.child.clone();
     tauri::async_runtime::spawn_blocking(move || start_ollama_impl(&app, &child))
@@ -705,6 +791,7 @@ async fn stop_ollama(
     app: AppHandle,
     state: tauri::State<'_, OllamaState>,
 ) -> Result<OllamaStatus, String> {
+    ensure_local_model_support()?;
     let app = app.clone();
     let child = state.child.clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -746,6 +833,7 @@ async fn ollama_status(
     app: AppHandle,
     state: tauri::State<'_, OllamaState>,
 ) -> Result<OllamaStatus, String> {
+    ensure_local_model_support()?;
     let app = app.clone();
     let child = state.child.clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -781,6 +869,7 @@ async fn pull_ollama_model(
     state: tauri::State<'_, OllamaState>,
     model: String,
 ) -> Result<String, String> {
+    ensure_local_model_support()?;
     let app = app.clone();
     let child = state.child.clone();
     tauri::async_runtime::spawn_blocking(move || pull_ollama_model_impl(&app, &child, &model))
@@ -793,6 +882,7 @@ async fn list_ollama_models(
     app: AppHandle,
     state: tauri::State<'_, OllamaState>,
 ) -> Result<Vec<String>, String> {
+    ensure_local_model_support()?;
     let app = app.clone();
     let child = state.child.clone();
     tauri::async_runtime::spawn_blocking(move || list_ollama_models_impl(&app, &child))
@@ -806,6 +896,7 @@ async fn check_local_model_exists(
     state: tauri::State<'_, OllamaState>,
     model: String,
 ) -> Result<bool, String> {
+    ensure_local_model_support()?;
     let app = app.clone();
     let child = state.child.clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -829,6 +920,7 @@ fn start_local_model_run(
     model_run_state: tauri::State<'_, LocalModelRunState>,
     model: String,
 ) -> Result<(), String> {
+    ensure_local_model_support()?;
     let normalized_model = normalize_and_validate_ollama_model_name(&model)?.to_string();
 
     let progress_state = model_run_state.progress.clone();
@@ -920,6 +1012,7 @@ fn start_local_model_run(
 fn get_local_model_run_progress(
     state: tauri::State<'_, LocalModelRunState>,
 ) -> Result<LocalModelRunProgress, String> {
+    ensure_local_model_support()?;
     state
         .progress
         .lock()
@@ -929,6 +1022,7 @@ fn get_local_model_run_progress(
 
 #[tauri::command]
 fn stop_local_model_run(state: tauri::State<'_, LocalModelRunState>) -> Result<(), String> {
+    ensure_local_model_support()?;
     let pid = state
         .pull_pid
         .lock()
@@ -1524,8 +1618,12 @@ fn whereclaw_cmd_escape(value: &str) -> String {
     value.replace('^', "^^")
 }
 
-fn whereclaw_terminal_hint_message() -> &'static str {
-    "Bundled commands: node, npm, npx, openclaw, ollama"
+fn whereclaw_terminal_hint_message(include_ollama: bool) -> &'static str {
+    if include_ollama {
+        "Bundled commands: node, npm, npx, openclaw, ollama"
+    } else {
+        "Bundled commands: node, npm, npx, openclaw"
+    }
 }
 
 fn build_whereclaw_terminal_openclaw_wrapper_script(
@@ -1578,8 +1676,15 @@ fn build_whereclaw_terminal_shell_rc(
     runtime_bin_dir: &str,
     package_root: &str,
     npm_registry_exports: &str,
-    ollama_models_dir: &str,
+    ollama_models_dir: Option<&str>,
 ) -> String {
+    let ollama_exports = ollama_models_dir.map_or_else(String::new, |models_dir| {
+        format!(
+            "export OLLAMA_HOST={ollama_host}\nexport OLLAMA_MODELS={ollama_models}\n",
+            ollama_host = shell_single_quote(OLLAMA_HOST),
+            ollama_models = shell_single_quote(models_dir),
+        )
+    });
     format!(
         "export OPENCLAW_HOME={home}
 export OPENCLAW_STATE_DIR={home}
@@ -1590,8 +1695,7 @@ export npm_config_cache={npm_cache}
 export NPM_CONFIG_PREFIX={npm_prefix}
 export npm_config_prefix={npm_prefix}
 export COREPACK_HOME={corepack_home}
-export OLLAMA_HOST={ollama_host}
-export OLLAMA_MODELS={ollama_models}
+{ollama_exports}\
 export PATH={terminal_bin}:{runtime_bin}:$PATH
 {npm_registry}cd {package_root}
 echo {banner}
@@ -1604,14 +1708,13 @@ echo
         npm_cache = shell_single_quote(npm_cache_dir),
         npm_prefix = shell_single_quote(npm_prefix_dir),
         corepack_home = shell_single_quote(corepack_home_dir),
-        ollama_host = shell_single_quote(OLLAMA_HOST),
-        ollama_models = shell_single_quote(ollama_models_dir),
+        ollama_exports = ollama_exports,
         terminal_bin = shell_single_quote(terminal_bin_dir),
         runtime_bin = shell_single_quote(runtime_bin_dir),
         npm_registry = npm_registry_exports,
         package_root = shell_single_quote(package_root),
         banner = shell_single_quote("WhereClaw terminal is ready."),
-        hint = shell_single_quote(whereclaw_terminal_hint_message()),
+        hint = shell_single_quote(whereclaw_terminal_hint_message(ollama_models_dir.is_some())),
     )
 }
 
@@ -1658,8 +1761,15 @@ fn build_whereclaw_terminal_windows_script(
     runtime_bin_dir: &str,
     package_root: &str,
     npm_registry_commands: &str,
-    ollama_models_dir: &str,
+    ollama_models_dir: Option<&str>,
 ) -> String {
+    let ollama_exports = ollama_models_dir.map_or_else(String::new, |models_dir| {
+        format!(
+            "set OLLAMA_HOST={ollama_host}\nset OLLAMA_MODELS={ollama_models}\n",
+            ollama_host = OLLAMA_HOST,
+            ollama_models = whereclaw_cmd_escape(models_dir),
+        )
+    });
     format!(
         "@echo off
 set OPENCLAW_HOME={home}
@@ -1671,8 +1781,7 @@ set npm_config_cache={npm_cache}
 set NPM_CONFIG_PREFIX={npm_prefix}
 set npm_config_prefix={npm_prefix}
 set COREPACK_HOME={corepack_home}
-set OLLAMA_HOST={ollama_host}
-set OLLAMA_MODELS={ollama_models}
+{ollama_exports}\
 set PATH={terminal_bin};{runtime_bin};%PATH%
 {npm_registry}cd /d {package_root}
 echo WhereClaw terminal is ready.
@@ -1686,13 +1795,12 @@ echo.
         npm_cache = whereclaw_cmd_escape(npm_cache_dir),
         npm_prefix = whereclaw_cmd_escape(npm_prefix_dir),
         corepack_home = whereclaw_cmd_escape(corepack_home_dir),
-        ollama_host = OLLAMA_HOST,
-        ollama_models = whereclaw_cmd_escape(ollama_models_dir),
+        ollama_exports = ollama_exports,
         terminal_bin = whereclaw_cmd_escape(terminal_bin_dir),
         runtime_bin = whereclaw_cmd_escape(runtime_bin_dir),
         npm_registry = npm_registry_commands,
         package_root = whereclaw_cmd_escape(package_root),
-        hint = whereclaw_terminal_hint_message(),
+        hint = whereclaw_terminal_hint_message(ollama_models_dir.is_some()),
     )
 }
 
@@ -1706,10 +1814,19 @@ fn open_whereclaw_terminal(app: AppHandle) -> Result<(), String> {
     }
 
     let engine_dir = resolve_engine_dir(&app)?;
+    let supports_local_models = current_build_variant().supports_local_models();
     let node_binary = resolve_node_binary(&engine_dir)?;
     let runtime_bin_dir = resolve_runtime_bin_dir(&engine_dir)?;
-    let ollama_binary = initialize_ollama_runtime(&app, &engine_dir)?;
-    let ollama_models_dir = resolve_ollama_models_dir(&app)?;
+    let ollama_binary = if supports_local_models {
+        Some(initialize_ollama_runtime(&app, &engine_dir)?)
+    } else {
+        None
+    };
+    let ollama_models_dir = if supports_local_models {
+        Some(resolve_ollama_models_dir(&app)?)
+    } else {
+        None
+    };
     let entry_script = resolve_openclaw_entry(&engine_dir)?;
     let openclaw_package_root = resolve_openclaw_package_root(&entry_script)?;
     let openclaw_home = initialize_openclaw_home(&app, &engine_dir)?;
@@ -1719,8 +1836,12 @@ fn open_whereclaw_terminal(app: AppHandle) -> Result<(), String> {
     let corepack_home_dir = resolve_corepack_home_dir(&openclaw_home);
     let node_binary_for_node = normalize_windows_path_for_node(&node_binary);
     let runtime_bin_dir_for_node = normalize_windows_path_for_node(&runtime_bin_dir);
-    let ollama_binary_for_node = normalize_windows_path_for_node(&ollama_binary);
-    let ollama_models_dir_for_node = normalize_windows_path_for_node(&ollama_models_dir);
+    let ollama_binary_for_node = ollama_binary
+        .as_ref()
+        .map(|path| normalize_windows_path_for_node(path));
+    let ollama_models_dir_for_node = ollama_models_dir
+        .as_ref()
+        .map(|path| normalize_windows_path_for_node(path));
     let entry_script_for_node = normalize_windows_path_for_node(&entry_script);
     let openclaw_package_root_for_node = normalize_windows_path_for_node(&openclaw_package_root);
     let terminal_bin_dir = openclaw_home.join("tmp").join("terminal-bin");
@@ -1754,21 +1875,25 @@ fn open_whereclaw_terminal(app: AppHandle) -> Result<(), String> {
                 format!("failed to mark WhereClaw terminal wrapper executable: {error}")
             })?;
 
-        let ollama_wrapper_path = terminal_bin_dir.join("ollama");
-        let ollama_wrapper = build_whereclaw_terminal_ollama_wrapper_script(
-            &ollama_binary.display().to_string(),
-            &ollama_models_dir.display().to_string(),
-        );
-        fs::write(&ollama_wrapper_path, ollama_wrapper).map_err(|error| {
-            format!("failed to write WhereClaw terminal ollama wrapper: {error}")
-        })?;
-        Command::new("chmod")
-            .arg("+x")
-            .arg(&ollama_wrapper_path)
-            .status()
-            .map_err(|error| {
-                format!("failed to mark WhereClaw terminal ollama wrapper executable: {error}")
+        if let (Some(ollama_binary), Some(ollama_models_dir)) =
+            (ollama_binary.as_ref(), ollama_models_dir.as_ref())
+        {
+            let ollama_wrapper_path = terminal_bin_dir.join("ollama");
+            let ollama_wrapper = build_whereclaw_terminal_ollama_wrapper_script(
+                &ollama_binary.display().to_string(),
+                &ollama_models_dir.display().to_string(),
+            );
+            fs::write(&ollama_wrapper_path, ollama_wrapper).map_err(|error| {
+                format!("failed to write WhereClaw terminal ollama wrapper: {error}")
             })?;
+            Command::new("chmod")
+                .arg("+x")
+                .arg(&ollama_wrapper_path)
+                .status()
+                .map_err(|error| {
+                    format!("failed to mark WhereClaw terminal ollama wrapper executable: {error}")
+                })?;
+        }
 
         for (command_name, cli_relative_path) in [
             ("npm", ["lib", "node_modules", "npm", "bin", "npm-cli.js"]),
@@ -1818,7 +1943,7 @@ fn open_whereclaw_terminal(app: AppHandle) -> Result<(), String> {
             &runtime_bin_dir.display().to_string(),
             &openclaw_package_root.display().to_string(),
             &npm_registry_exports,
-            &ollama_models_dir.display().to_string(),
+            ollama_models_dir.as_ref().map(|path| path.display().to_string()).as_deref(),
         );
         fs::write(&shell_rc_path, shell_rc)
             .map_err(|error| format!("failed to write WhereClaw terminal environment: {error}"))?;
@@ -1855,14 +1980,19 @@ fn open_whereclaw_terminal(app: AppHandle) -> Result<(), String> {
         fs::write(&openclaw_wrapper_path, openclaw_wrapper)
             .map_err(|error| format!("failed to write WhereClaw terminal wrapper: {error}"))?;
 
-        let ollama_wrapper_path = terminal_bin_dir.join("ollama.cmd");
-        let ollama_wrapper = build_whereclaw_terminal_windows_ollama_wrapper_script(
-            &ollama_binary_for_node.display().to_string(),
-            &ollama_models_dir_for_node.display().to_string(),
-        );
-        fs::write(&ollama_wrapper_path, ollama_wrapper).map_err(|error| {
-            format!("failed to write WhereClaw terminal ollama wrapper: {error}")
-        })?;
+        if let (Some(ollama_binary_for_node), Some(ollama_models_dir_for_node)) = (
+            ollama_binary_for_node.as_ref(),
+            ollama_models_dir_for_node.as_ref(),
+        ) {
+            let ollama_wrapper_path = terminal_bin_dir.join("ollama.cmd");
+            let ollama_wrapper = build_whereclaw_terminal_windows_ollama_wrapper_script(
+                &ollama_binary_for_node.display().to_string(),
+                &ollama_models_dir_for_node.display().to_string(),
+            );
+            fs::write(&ollama_wrapper_path, ollama_wrapper).map_err(|error| {
+                format!("failed to write WhereClaw terminal ollama wrapper: {error}")
+            })?;
+        }
 
         let script_path = openclaw_home.join("tmp").join("whereclaw-terminal.cmd");
         let npm_registry_commands = npm_registry_cmd_exports(&launcher_preferences.language);
@@ -1877,7 +2007,10 @@ fn open_whereclaw_terminal(app: AppHandle) -> Result<(), String> {
             &runtime_bin_dir_for_node.display().to_string(),
             &openclaw_package_root_for_node.display().to_string(),
             &npm_registry_commands,
-            &ollama_models_dir_for_node.display().to_string(),
+            ollama_models_dir_for_node
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .as_deref(),
         );
         fs::write(&script_path, script)
             .map_err(|error| format!("failed to write WhereClaw terminal script: {error}"))?;
@@ -2515,12 +2648,17 @@ async fn apply_initial_setup_config(
         let openclaw_home = initialize_openclaw_home(&app, &engine_dir)?;
         let mut config = read_openclaw_config(&openclaw_home)?;
         let root = ensure_object(&mut config, "OpenClaw config root")?;
+        let build_variant = current_build_variant();
 
-        if let Some(model) = request.local_model {
-            let normalized_model = normalize_and_validate_ollama_model_name(&model)?;
-            if !normalized_model.is_empty() {
-                apply_initial_ollama_model_config(root, normalized_model);
+        if build_variant.supports_local_models() {
+            if let Some(model) = request.local_model {
+                let normalized_model = normalize_and_validate_ollama_model_name(&model)?;
+                if !normalized_model.is_empty() {
+                    apply_initial_ollama_model_config(root, normalized_model);
+                }
             }
+        } else if let Some(cloud_model) = request.cloud_model.as_ref() {
+            apply_initial_cloud_model_config(root, cloud_model)?;
         }
 
         match request.channel_selection.unwrap_or(InitialChannelSelection::None) {
@@ -4349,6 +4487,7 @@ fn resolve_launcher_settings_path(app: &AppHandle) -> Result<PathBuf, String> {
 }
 
 fn read_setup_info_impl(app: &AppHandle) -> Result<SetupInfo, String> {
+    let build_variant = current_build_variant();
     let engine_dir = resolve_engine_dir(app)?;
     let openclaw_home = initialize_openclaw_home(app, &engine_dir)?;
     let config = read_openclaw_config(&openclaw_home)?;
@@ -4359,6 +4498,8 @@ fn read_setup_info_impl(app: &AppHandle) -> Result<SetupInfo, String> {
 
     Ok(SetupInfo {
         configured: is_configured(&config),
+        build_variant,
+        supports_local_models: build_variant.supports_local_models(),
         openclaw_home: openclaw_home.display().to_string(),
         config_path: openclaw_home.join("openclaw.json").display().to_string(),
         current_model_ref,
@@ -5378,6 +5519,125 @@ fn apply_initial_ollama_model_config(root: &mut Map<String, Value>, model: &str)
     }
 }
 
+fn apply_initial_cloud_model_config(
+    root: &mut Map<String, Value>,
+    config: &InitialCloudModelConfig,
+) -> Result<(), String> {
+    let base_url = config.base_url.trim().trim_end_matches('/');
+    let api_key = config.api_key.trim();
+    let model = config.model.trim();
+    if base_url.is_empty() {
+        return Err(String::from("cloud model base URL is required"));
+    }
+    if api_key.is_empty() {
+        return Err(String::from("cloud model API key is required"));
+    }
+    if model.is_empty() {
+        return Err(String::from("cloud model name is required"));
+    }
+    let parsed_url =
+        Url::parse(base_url).map_err(|error| format!("invalid cloud model base URL: {error}"))?;
+    if !matches!(parsed_url.scheme(), "http" | "https") {
+        return Err(String::from(
+            "cloud model base URL must use http or https",
+        ));
+    }
+
+    let provider_id = String::from("openai-compatible");
+    let model_ref = format!("{provider_id}/{model}");
+
+    let agents = root
+        .entry(String::from("agents"))
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Some(agents_obj) = agents.as_object_mut() else {
+        return Err(String::from("agents config must be an object"));
+    };
+    let defaults = agents_obj
+        .entry(String::from("defaults"))
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Some(defaults_obj) = defaults.as_object_mut() else {
+        return Err(String::from("agents.defaults config must be an object"));
+    };
+
+    let models_aliases = defaults_obj
+        .entry(String::from("models"))
+        .or_insert_with(|| Value::Object(Map::new()));
+    if let Some(models_aliases_obj) = models_aliases.as_object_mut() {
+        let model_alias = models_aliases_obj
+            .entry(model_ref.clone())
+            .or_insert_with(|| Value::Object(Map::new()));
+        if let Some(model_alias_obj) = model_alias.as_object_mut() {
+            model_alias_obj.insert(String::from("alias"), Value::String(String::from(model)));
+        }
+    }
+
+    let model_config = defaults_obj
+        .entry(String::from("model"))
+        .or_insert_with(|| Value::Object(Map::new()));
+    if let Some(model_config_obj) = model_config.as_object_mut() {
+        model_config_obj.insert(String::from("primary"), Value::String(model_ref));
+    }
+
+    let models = root
+        .entry(String::from("models"))
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Some(models_obj) = models.as_object_mut() else {
+        return Err(String::from("models config must be an object"));
+    };
+    models_obj.insert(String::from("mode"), Value::String(String::from("merge")));
+
+    let providers = models_obj
+        .entry(String::from("providers"))
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Some(providers_obj) = providers.as_object_mut() else {
+        return Err(String::from("models.providers config must be an object"));
+    };
+
+    let provider = providers_obj
+        .entry(provider_id)
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Some(provider_obj) = provider.as_object_mut() else {
+        return Err(String::from(
+            "openai-compatible provider config must be an object",
+        ));
+    };
+
+    provider_obj.insert(
+        String::from("baseUrl"),
+        Value::String(parsed_url.to_string().trim_end_matches('/').to_string()),
+    );
+    provider_obj.insert(
+        String::from("api"),
+        Value::String(String::from("openai-completions")),
+    );
+    provider_obj.insert(String::from("apiKey"), Value::String(String::from(api_key)));
+
+    let model_definition = serde_json::json!({
+        "id": model,
+        "name": model,
+        "reasoning": false,
+        "input": ["text"],
+        "contextWindow": 128000,
+        "maxTokens": 4096
+    });
+
+    match provider_obj.get_mut("models") {
+        Some(Value::Array(models)) => {
+            let exists = models
+                .iter()
+                .any(|entry| entry.get("id").and_then(Value::as_str) == Some(model));
+            if !exists {
+                models.push(model_definition);
+            }
+        }
+        _ => {
+            provider_obj.insert(String::from("models"), Value::Array(vec![model_definition]));
+        }
+    }
+
+    Ok(())
+}
+
 fn apply_initial_qq_channel_config(
     root: &mut Map<String, Value>,
     app_id: &str,
@@ -6002,7 +6262,7 @@ fn write_openclaw_config(openclaw_home: &Path, config: &Value) -> Result<(), Str
 fn sanitize_openclaw_config(openclaw_home: &Path, engine_dir: Option<&Path>) -> Result<(), String> {
     let mut config = read_openclaw_config(openclaw_home)?;
     let root = ensure_object(&mut config, "OpenClaw config root")?;
-    let mut changed = false;
+    let mut changed = sanitize_model_provider_apis(root);
 
     if let Some(commands) = root.get_mut("commands").and_then(Value::as_object_mut) {
         if commands.remove("ownerDisplay").is_some() {
@@ -6056,6 +6316,38 @@ fn sanitize_openclaw_config(openclaw_home: &Path, engine_dir: Option<&Path>) -> 
     }
 
     Ok(())
+}
+
+fn sanitize_model_provider_apis(root: &mut Map<String, Value>) -> bool {
+    let Some(providers) = root
+        .get_mut("models")
+        .and_then(Value::as_object_mut)
+        .and_then(|models| models.get_mut("providers"))
+        .and_then(Value::as_object_mut)
+    else {
+        return false;
+    };
+
+    let Some(provider) = providers
+        .get_mut("openai-compatible")
+        .and_then(Value::as_object_mut)
+    else {
+        return false;
+    };
+
+    let uses_legacy_api = provider
+        .get("api")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value == "openai");
+    if !uses_legacy_api {
+        return false;
+    }
+
+    provider.insert(
+        String::from("api"),
+        Value::String(String::from("openai-completions")),
+    );
+    true
 }
 
 fn initialize_openclaw_tmp_dir(openclaw_home: &Path) -> Result<PathBuf, String> {
@@ -6450,16 +6742,18 @@ mod tests {
 
     use super::{
         apply_initial_qq_channel_config, apply_initial_weixin_channel_config,
+        apply_initial_cloud_model_config, sanitize_model_provider_apis, BuildVariant,
         build_clawhub_install_args, build_initial_weixin_login_helper_script,
         build_whereclaw_terminal_node_cli_wrapper_script,
         build_whereclaw_terminal_ollama_wrapper_script, build_whereclaw_terminal_shell_rc,
         build_whereclaw_terminal_windows_script, clawhub_marketplace_initialization_script,
         clawhub_marketplace_title_for_language, clawhub_marketplace_url_for_language,
         clawhub_skill_id_from_url, clawhub_skill_install_dir_exists, ensure_object,
+        ensure_local_model_support_for,
         control_ui_window_initialization_script, normalize_ollama_model_name_for_lookup,
         read_bundled_openclaw_version_from_package_root, repair_plugin_load_paths,
         resolve_dist_hashed_module_path, resolve_dist_module_export_alias,
-        resolve_openclaw_entry,
+        resolve_openclaw_entry, tray_icon_file_name_for_target, InitialCloudModelConfig,
         CLAWHUB_CN_MARKETPLACE_URL, CLAWHUB_CN_WINDOW_TITLE,
         CLAWHUB_EN_MARKETPLACE_URL, CLAWHUB_EN_WINDOW_TITLE, CLAWHUB_INSTALL_REGISTRY,
         CLAWHUB_STATUS_COMMAND, HEALTH_CHECK_ATTEMPTS, HEALTH_CHECK_DELAY_MS, OLLAMA_HOST,
@@ -6610,6 +6904,95 @@ mod tests {
     }
 
     #[test]
+    fn build_variant_defaults_to_local_for_unknown_values() {
+        assert_eq!(BuildVariant::from_env(None), BuildVariant::Local);
+        assert_eq!(BuildVariant::from_env(Some("unexpected")), BuildVariant::Local);
+    }
+
+    #[test]
+    fn build_variant_parses_cloud_value() {
+        assert_eq!(BuildVariant::from_env(Some("cloud")), BuildVariant::Cloud);
+        assert!(!BuildVariant::Cloud.supports_local_models());
+    }
+
+    #[test]
+    fn chooses_platform_specific_tray_icon_assets() {
+        assert_eq!(
+            tray_icon_file_name_for_target("macos"),
+            Some("tray-icon-macos.png")
+        );
+        assert_eq!(
+            tray_icon_file_name_for_target("windows"),
+            Some("tray-icon-windows.png")
+        );
+        assert_eq!(tray_icon_file_name_for_target("linux"), None);
+    }
+
+    #[test]
+    fn local_model_commands_are_rejected_for_cloud_builds() {
+        assert_eq!(
+            ensure_local_model_support_for(BuildVariant::Cloud),
+            Err(String::from("local models are not available in the cloud build"))
+        );
+    }
+
+    #[test]
+    fn initial_cloud_model_config_uses_openai_completions_api() {
+        let mut root = Map::new();
+        let config = InitialCloudModelConfig {
+            base_url: String::from("https://example.com/v1/"),
+            api_key: String::from("test-key"),
+            model: String::from("gpt-4.1"),
+        };
+
+        apply_initial_cloud_model_config(&mut root, &config)
+            .expect("cloud model config should be written");
+
+        let provider = root
+            .get("models")
+            .and_then(Value::as_object)
+            .and_then(|models| models.get("providers"))
+            .and_then(Value::as_object)
+            .and_then(|providers| providers.get("openai-compatible"))
+            .and_then(Value::as_object)
+            .expect("openai-compatible provider should exist");
+
+        assert_eq!(
+            provider.get("api").and_then(Value::as_str),
+            Some("openai-completions")
+        );
+        assert_eq!(
+            provider.get("baseUrl").and_then(Value::as_str),
+            Some("https://example.com/v1")
+        );
+    }
+
+    #[test]
+    fn sanitize_model_provider_apis_migrates_legacy_openai_value() {
+        let mut root = Map::new();
+        let mut provider = Map::new();
+        provider.insert(String::from("api"), Value::String(String::from("openai")));
+        let mut providers = Map::new();
+        providers.insert(String::from("openai-compatible"), Value::Object(provider));
+        let mut models = Map::new();
+        models.insert(String::from("providers"), Value::Object(providers));
+        root.insert(String::from("models"), Value::Object(models));
+
+        assert!(sanitize_model_provider_apis(&mut root));
+        assert_eq!(
+            root.get("models")
+                .and_then(Value::as_object)
+                .and_then(|models| models.get("providers"))
+                .and_then(Value::as_object)
+                .and_then(|providers| providers.get("openai-compatible"))
+                .and_then(Value::as_object)
+                .and_then(|provider| provider.get("api"))
+                .and_then(Value::as_str),
+            Some("openai-completions")
+        );
+    }
+
+    #[test]
     fn whereclaw_terminal_shell_rc_exports_ollama_and_advertises_command() {
         let shell_rc = build_whereclaw_terminal_shell_rc(
             "/openclaw/home",
@@ -6622,12 +7005,33 @@ mod tests {
             "/engine/node-runtime/bin",
             "/openclaw/package",
             "",
-            "/openclaw/home/data/ollama-models",
+            Some("/openclaw/home/data/ollama-models"),
         );
 
         assert!(shell_rc.contains("export OLLAMA_HOST='127.0.0.1:11434'"));
         assert!(shell_rc.contains("export OLLAMA_MODELS='/openclaw/home/data/ollama-models'"));
         assert!(shell_rc.contains("Bundled commands: node, npm, npx, openclaw, ollama"));
+    }
+
+    #[test]
+    fn whereclaw_terminal_shell_rc_skips_ollama_for_cloud_builds() {
+        let shell_rc = build_whereclaw_terminal_shell_rc(
+            "/openclaw/home",
+            "/openclaw/home/openclaw.json",
+            "/openclaw/home/tmp",
+            "/openclaw/home/data/npm-cache",
+            "/openclaw/home/data/npm-prefix",
+            "/openclaw/home/data/corepack",
+            "/openclaw/home/tmp/terminal-bin",
+            "/engine/node-runtime/bin",
+            "/openclaw/package",
+            "",
+            None,
+        );
+
+        assert!(!shell_rc.contains("OLLAMA_HOST"));
+        assert!(!shell_rc.contains("OLLAMA_MODELS"));
+        assert!(shell_rc.contains("Bundled commands: node, npm, npx, openclaw"));
     }
 
     #[test]
@@ -6667,12 +7071,33 @@ mod tests {
             "C:/engine/node-runtime",
             "C:/openclaw/package",
             "",
-            "C:/openclaw/home/data/ollama-models",
+            Some("C:/openclaw/home/data/ollama-models"),
         );
 
         assert!(script.contains(&format!("set OLLAMA_HOST={}", OLLAMA_HOST)));
         assert!(script.contains("set OLLAMA_MODELS=C:/openclaw/home/data/ollama-models"));
         assert!(script.contains("Bundled commands: node, npm, npx, openclaw, ollama"));
+    }
+
+    #[test]
+    fn whereclaw_terminal_windows_script_skips_ollama_for_cloud_builds() {
+        let script = build_whereclaw_terminal_windows_script(
+            "C:/openclaw/home",
+            "C:/openclaw/home/openclaw.json",
+            "C:/openclaw/home/tmp",
+            "C:/openclaw/home/data/npm-cache",
+            "C:/openclaw/home/data/npm-prefix",
+            "C:/openclaw/home/data/corepack",
+            "C:/openclaw/home/tmp/terminal-bin",
+            "C:/engine/node-runtime",
+            "C:/openclaw/package",
+            "",
+            None,
+        );
+
+        assert!(!script.contains("OLLAMA_HOST"));
+        assert!(!script.contains("OLLAMA_MODELS"));
+        assert!(script.contains("Bundled commands: node, npm, npx, openclaw"));
     }
 
     #[test]

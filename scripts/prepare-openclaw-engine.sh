@@ -14,6 +14,7 @@ cleanup() {
 trap cleanup EXIT
 
 NODE_VERSION="${NODE_VERSION:-22.20.0}"
+BUILD_VARIANT="${WHERECLAW_BUILD_VARIANT:-local}"
 WEIXIN_CHANNEL_PLUGIN_SPEC="${WEIXIN_CHANNEL_PLUGIN_SPEC:-@tencent-weixin/openclaw-weixin@latest}"
 OPTIONAL_CHANNEL_PLUGIN_DIRS=(
   "bluebubbles"
@@ -393,13 +394,17 @@ install_optional_channel_plugin_dependencies() {
 }
 
 main() {
-  local ollama_platform_dir
+  local ollama_platform_dir=""
 
-  ollama_platform_dir="$(detect_ollama_platform_dir)"
   mkdir -p "$ENGINE_DIR/openclaw" "$ENGINE_DIR/templates" "$ENGINE_DIR/ollama"
 
   download_and_extract_node
-  download_and_extract_ollama
+  if [[ "$BUILD_VARIANT" == "local" ]]; then
+    ollama_platform_dir="$(detect_ollama_platform_dir)"
+    download_and_extract_ollama
+  else
+    rm -rf "$ENGINE_DIR/ollama"
+  fi
   install_openclaw
   install_bundled_weixin_plugin
   install_optional_channel_plugin_dependencies
@@ -416,13 +421,19 @@ OpenClaw package:  openclaw@latest
 Node runtime:      $NODE_RUNTIME_DIR
 Node binary:       $NODE_RUNTIME_DIR/bin/node
 NPM binary:        $NODE_RUNTIME_DIR/bin/npm
-Ollama version:    $(cat "$ENGINE_DIR/ollama/VERSION")
-Ollama runtime:    $ENGINE_DIR/ollama/$ollama_platform_dir
-Ollama binary:     $ENGINE_DIR/ollama/$ollama_platform_dir/ollama
+Build variant:     $BUILD_VARIANT
 OpenClaw entry:    $ENGINE_DIR/openclaw/node_modules/openclaw/openclaw.mjs
 Control UI:        $ENGINE_DIR/openclaw/node_modules/openclaw/dist/control-ui/index.html
 Runtime UI copy:   $NODE_RUNTIME_DIR/bin/control-ui/index.html
 EOF
+
+  if [[ "$BUILD_VARIANT" == "local" ]]; then
+    cat <<EOF
+Ollama version:    $(cat "$ENGINE_DIR/ollama/VERSION")
+Ollama runtime:    $ENGINE_DIR/ollama/$ollama_platform_dir
+Ollama binary:     $ENGINE_DIR/ollama/$ollama_platform_dir/ollama
+EOF
+  fi
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

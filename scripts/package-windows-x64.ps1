@@ -2,11 +2,12 @@ $ErrorActionPreference = 'Stop'
 
 $RootDir = Split-Path -Parent $PSScriptRoot
 $Target = 'x86_64-pc-windows-msvc'
+$BuildVariant = if ([string]::IsNullOrWhiteSpace($env:WHERECLAW_BUILD_VARIANT)) { 'local' } else { $env:WHERECLAW_BUILD_VARIANT }
 $ReleaseDir = Join-Path $RootDir "src-tauri\target\$Target\release"
-$OutDir = Join-Path $RootDir 'release-artifacts\windows-x64'
+$OutDir = Join-Path $RootDir "release-artifacts\windows-x64-$BuildVariant"
 $StageRoot = Join-Path $env:TEMP ("wc-portable-" + [System.Guid]::NewGuid().ToString('N'))
 $PortableRoot = Join-Path $StageRoot 'WhereClaw'
-$ZipPath = Join-Path $OutDir 'WhereClaw_x86_64-pc-windows-msvc_portable.zip'
+$ZipPath = Join-Path $OutDir "WhereClaw_x86_64-pc-windows-msvc_${BuildVariant}_portable.zip"
 
 function Ensure-ToolOnPath {
   param(
@@ -106,6 +107,7 @@ try {
     (Join-Path $env:USERPROFILE '.cargo\bin')
   )
   Invoke-Step 'npm ci' { npm ci }
+  $env:WHERECLAW_BUILD_VARIANT = $BuildVariant
   Invoke-Step 'prepare:openclaw-engine:windows' { npm run prepare:openclaw-engine:windows }
   Invoke-Step 'tauri build' { npm run tauri build -- --target $Target --no-bundle }
 

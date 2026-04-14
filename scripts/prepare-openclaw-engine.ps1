@@ -1,5 +1,6 @@
 param(
   [string]$NodeVersion = "22.20.0",
+  [string]$BuildVariant = "",
   [string]$WeixinChannelPluginSpec = "@tencent-weixin/openclaw-weixin@latest"
 )
 
@@ -12,6 +13,9 @@ catch {
 }
 
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+if ([string]::IsNullOrWhiteSpace($BuildVariant)) {
+  $BuildVariant = if ([string]::IsNullOrWhiteSpace($env:WHERECLAW_BUILD_VARIANT)) { "local" } else { $env:WHERECLAW_BUILD_VARIANT }
+}
 
 $RootDir = Split-Path -Parent $PSScriptRoot
 $EngineDir = Join-Path $RootDir "whereclaw-engine"
@@ -376,31 +380,40 @@ try {
     throw "Bundled Node runtime is missing npm.cmd."
   }
 
-  $OllamaArchiveName = Get-OllamaArchiveName
-  $OllamaArchivePath = Join-Path $TempDir $OllamaArchiveName
-  $OllamaExtractDir = Join-Path $TempDir "ollama-extract"
-  $OllamaPlatformDir = Get-OllamaPlatformDir
-  $OllamaRuntimeDir = Join-Path $OllamaRootDir $OllamaPlatformDir
+  $OllamaPlatformDir = $null
+  $OllamaRuntimeDir = $null
+  $OllamaExe = $null
+  $ResolvedOllamaVersion = $null
+  if ($BuildVariant -eq "local") {
+    $OllamaArchiveName = Get-OllamaArchiveName
+    $OllamaArchivePath = Join-Path $TempDir $OllamaArchiveName
+    $OllamaExtractDir = Join-Path $TempDir "ollama-extract"
+    $OllamaPlatformDir = Get-OllamaPlatformDir
+    $OllamaRuntimeDir = Join-Path $OllamaRootDir $OllamaPlatformDir
 
-  Write-Host "Downloading latest Ollama ($OllamaArchiveName)..."
-  Download-File -Uri "https://github.com/ollama/ollama/releases/latest/download/$OllamaArchiveName" -OutFile $OllamaArchivePath -Label "latest Ollama"
-  Expand-Archive -Path $OllamaArchivePath -DestinationPath $OllamaExtractDir -Force
+    Write-Host "Downloading latest Ollama ($OllamaArchiveName)..."
+    Download-File -Uri "https://github.com/ollama/ollama/releases/latest/download/$OllamaArchiveName" -OutFile $OllamaArchivePath -Label "latest Ollama"
+    Expand-Archive -Path $OllamaArchivePath -DestinationPath $OllamaExtractDir -Force
 
-  Remove-DirectoryIfExists $OllamaRuntimeDir
-  New-Item -ItemType Directory -Force -Path $OllamaRuntimeDir | Out-Null
-  Copy-Item -Recurse -Force (Join-Path $OllamaExtractDir "*") $OllamaRuntimeDir
+    Remove-DirectoryIfExists $OllamaRuntimeDir
+    New-Item -ItemType Directory -Force -Path $OllamaRuntimeDir | Out-Null
+    Copy-Item -Recurse -Force (Join-Path $OllamaExtractDir "*") $OllamaRuntimeDir
 
-  $OllamaExe = Join-Path $OllamaRuntimeDir "ollama.exe"
-  if (-not (Test-Path $OllamaExe)) {
-    throw "Bundled Ollama runtime is missing ollama.exe."
+    $OllamaExe = Join-Path $OllamaRuntimeDir "ollama.exe"
+    if (-not (Test-Path $OllamaExe)) {
+      throw "Bundled Ollama runtime is missing ollama.exe."
+    }
+    $OllamaVersionOutput = & $OllamaExe --version
+    $OllamaVersionMatch = [regex]::Match($OllamaVersionOutput, '([0-9]+\.[0-9]+\.[0-9]+)')
+    if (-not $OllamaVersionMatch.Success) {
+      throw "Unable to determine downloaded Ollama version from: $OllamaVersionOutput"
+    }
+    $ResolvedOllamaVersion = $OllamaVersionMatch.Groups[1].Value
+    Set-Content -Path (Join-Path $OllamaRootDir "VERSION") -Value $ResolvedOllamaVersion
   }
-  $OllamaVersionOutput = & $OllamaExe --version
-  $OllamaVersionMatch = [regex]::Match($OllamaVersionOutput, '([0-9]+\.[0-9]+\.[0-9]+)')
-  if (-not $OllamaVersionMatch.Success) {
-    throw "Unable to determine downloaded Ollama version from: $OllamaVersionOutput"
+  else {
+    Remove-DirectoryIfExists $OllamaRootDir
   }
-  $ResolvedOllamaVersion = $OllamaVersionMatch.Groups[1].Value
-  Set-Content -Path (Join-Path $OllamaRootDir "VERSION") -Value $ResolvedOllamaVersion
 
   $InstallRoot = Join-Path $TempDir "openclaw-install"
   New-Item -ItemType Directory -Force -Path $InstallRoot | Out-Null
@@ -462,9 +475,12 @@ try {
   Write-Host "Node runtime:      $NodeRuntimeDir"
   Write-Host "Node binary:       $NodeExe"
   Write-Host "NPM binary:        $NpmCmd"
-  Write-Host "Ollama version:    $ResolvedOllamaVersion"
-  Write-Host "Ollama runtime:    $OllamaRuntimeDir"
-  Write-Host "Ollama binary:     $OllamaExe"
+  Write-Host "Build variant:     $BuildVariant"
+  if ($BuildVariant -eq "local") {
+    Write-Host "Ollama version:    $ResolvedOllamaVersion"
+    Write-Host "Ollama runtime:    $OllamaRuntimeDir"
+    Write-Host "Ollama binary:     $OllamaExe"
+  }
   Write-Host "OpenClaw entry:    $EntryPath"
   Write-Host "Control UI:        $UiPath"
   Write-Host "Runtime UI copy:   $RuntimeUiIndex"

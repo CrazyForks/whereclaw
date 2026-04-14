@@ -33,6 +33,8 @@ type LauncherPreferences = {
 
 type SetupInfo = {
   configured: boolean;
+  buildVariant: "local" | "cloud";
+  supportsLocalModels: boolean;
   openclawHome: string;
   configPath: string;
   currentModelRef: string;
@@ -171,6 +173,11 @@ type StatusLogContext = Record<string, unknown>;
 
 type InitialSetupConfigRequest = {
   localModel?: string;
+  cloudModel?: {
+    baseUrl: string;
+    apiKey: string;
+    model: string;
+  };
   channelSelection?: InitialChannelSelection;
   qq?: {
     appId: string;
@@ -230,6 +237,7 @@ type Copy = {
   saving: string;
   loading: string;
   modelQuestion: string;
+  cloudModelQuestion: string;
   channelQuestion: string;
   channelDescription: string;
   channelWeixinLabel: string;
@@ -254,7 +262,18 @@ type Copy = {
   yes: string;
   no: string;
   modelNameLabel: string;
+  cloudBaseUrlLabel: string;
+  cloudApiKeyLabel: string;
+  cloudModelNameLabel: string;
+  cloudConfigHint: string;
+  cloudBaseUrlPlaceholder: string;
+  cloudApiKeyPlaceholder: string;
+  cloudModelNamePlaceholder: string;
   modelNameValidationEmpty: string;
+  cloudBaseUrlValidationEmpty: string;
+  cloudApiKeyValidationEmpty: string;
+  cloudModelValidationEmpty: string;
+  cloudBaseUrlInvalid: string;
   modelNameInvalid: string;
   modelNameCloudHint: string;
   modelNoLocalHint: string;
@@ -471,6 +490,7 @@ const copyByLanguage: Record<LauncherLanguage, Copy> = {
     saving: "Saving...",
     loading: "Loading...",
     modelQuestion: "Run a local model?",
+    cloudModelQuestion: "Connect a cloud model?",
     channelQuestion: "Connect a chat channel?",
     channelDescription: "Choose the channel to connect during initialization.",
     channelWeixinLabel: "WeChat",
@@ -504,7 +524,19 @@ const copyByLanguage: Record<LauncherLanguage, Copy> = {
     yes: "Yes",
     no: "No",
     modelNameLabel: "Enter model name",
+    cloudBaseUrlLabel: "OpenAI-compatible Base URL",
+    cloudApiKeyLabel: "API Key",
+    cloudModelNameLabel: "Model Name",
+    cloudConfigHint:
+      "Default provider mode uses `openai-completions`. Please select 'No' for other models; they can be added later in model management.",
+    cloudBaseUrlPlaceholder: "https://api.deepseek.com/",
+    cloudApiKeyPlaceholder: "sk-...",
+    cloudModelNamePlaceholder: "deepseek-chat",
     modelNameValidationEmpty: "Enter a model name first.",
+    cloudBaseUrlValidationEmpty: "Enter a base URL first.",
+    cloudApiKeyValidationEmpty: "Enter an API key first.",
+    cloudModelValidationEmpty: "Enter a model name first.",
+    cloudBaseUrlInvalid: "Base URL must start with http:// or https://.",
     modelNameInvalid: "Model name is invalid.",
     modelNameCloudHint:
       "This model is a cloud model, not a local model. Please use a local model name.",
@@ -746,6 +778,7 @@ const copyByLanguage: Record<LauncherLanguage, Copy> = {
     saving: "正在保存...",
     loading: "加载中...",
     modelQuestion: "是否在本地运行大模型？",
+    cloudModelQuestion: "是否接入云端模型？",
     channelQuestion: "是否接入对话通道？",
     channelDescription: "选择要在初始化阶段完成接入的通道。",
     channelWeixinLabel: "微信",
@@ -778,7 +811,19 @@ const copyByLanguage: Record<LauncherLanguage, Copy> = {
     yes: "是",
     no: "否",
     modelNameLabel: "输入模型名称",
+    cloudBaseUrlLabel: "OpenAI 兼容 Base URL",
+    cloudApiKeyLabel: "API Key",
+    cloudModelNameLabel: "模型名称",
+    cloudConfigHint:
+      "默认使用 `openai-completions`。其他模型请选择'否'，后续在模型管理中添加。",
+    cloudBaseUrlPlaceholder: "https://api.deepseek.com/",
+    cloudApiKeyPlaceholder: "sk-...",
+    cloudModelNamePlaceholder: "deepseek-chat",
     modelNameValidationEmpty: "请先输入模型名称。",
+    cloudBaseUrlValidationEmpty: "请先输入 Base URL。",
+    cloudApiKeyValidationEmpty: "请先输入 API Key。",
+    cloudModelValidationEmpty: "请先输入模型名称。",
+    cloudBaseUrlInvalid: "Base URL 必须以 http:// 或 https:// 开头。",
     modelNameInvalid: "模型名称有误。",
     modelNameCloudHint: "此模型属于云端模型，非本地模型，请使用本地模型名称。",
     modelNoLocalHint:
@@ -1027,7 +1072,11 @@ export default function App() {
     useState(false);
   const [pickerValidationMessage, setPickerValidationMessage] = useState("");
   const [wantsLocalModel, setWantsLocalModel] = useState<boolean | null>(null);
+  const [wantsCloudModel, setWantsCloudModel] = useState<boolean | null>(null);
   const [localModelName, setLocalModelName] = useState<string>("");
+  const [cloudBaseUrl, setCloudBaseUrl] = useState<string>("");
+  const [cloudApiKey, setCloudApiKey] = useState<string>("");
+  const [cloudModelName, setCloudModelName] = useState<string>("");
   const [isValidatingLocalModelName, setIsValidatingLocalModelName] =
     useState(false);
   const [modelStepMessage, setModelStepMessage] = useState("");
@@ -1169,6 +1218,7 @@ export default function App() {
   const shouldStickLogsToBottomRef = useRef(true);
 
   const copy = copyByLanguage[selectedLanguage];
+  const supportsLocalModels = setupInfo?.supportsLocalModels ?? false;
   const consoleVersionLabel = `${copy.consoleVersionName} v${appVersion ?? "..."}`;
   const configured = setupInfo?.configured ?? false;
   const isReady = gatewayStatus?.running ?? false;
@@ -1234,6 +1284,14 @@ export default function App() {
   );
   const shouldShowLocalDownloadProgress =
     isBackgroundDownloadRunning || hasPendingLocalDownload;
+  useEffect(() => {
+    if (!supportsLocalModels && selectedLogSource === "ollama") {
+      setSelectedLogSource("launcher");
+    }
+    if (!supportsLocalModels && configPage === "local-model") {
+      setConfigPage(null);
+    }
+  }, [configPage, selectedLogSource, supportsLocalModels]);
   const gatewayStateInput = {
     configured,
     isStartingGateway,
@@ -1364,12 +1422,13 @@ export default function App() {
     language: LauncherLanguage,
     progressOverride: LocalModelRunProgress | null = localModelRunProgress,
   ) => {
-    const [nextSetupInfo, nextGatewayStatus, nextOllamaStatus] =
-      await Promise.all([
-        invoke<SetupInfo>("read_setup_info"),
-        invoke<GatewayStatus>("gateway_status"),
-        invoke<OllamaStatus>("ollama_status"),
-      ]);
+    const [nextSetupInfo, nextGatewayStatus] = await Promise.all([
+      invoke<SetupInfo>("read_setup_info"),
+      invoke<GatewayStatus>("gateway_status"),
+    ]);
+    const nextOllamaStatus = nextSetupInfo.supportsLocalModels
+      ? await invoke<OllamaStatus>("ollama_status")
+      : null;
 
     setSetupInfo(nextSetupInfo);
     setGatewayStatus(nextGatewayStatus);
@@ -1384,8 +1443,9 @@ export default function App() {
     let nextConfiguredLocalModelExists: boolean | null = null;
     const nextLocalModelName = nextSetupInfo.currentModelName.trim();
     const nextRequiresExistingLocalModel =
-      nextSetupInfo.currentModelIsLocal ||
-      nextSetupInfo.currentModelProvider.trim() === "ollama";
+      nextSetupInfo.supportsLocalModels &&
+      (nextSetupInfo.currentModelIsLocal ||
+        nextSetupInfo.currentModelProvider.trim() === "ollama");
 
     if (nextRequiresExistingLocalModel && nextLocalModelName.length > 0) {
       try {
@@ -1464,11 +1524,13 @@ export default function App() {
     void (async () => {
       setIsLoading(true);
       try {
-        const nextPreferences = await invoke<LauncherPreferences>(
-          "read_launcher_preferences",
-        );
+        const [nextPreferences, nextSetupInfo] = await Promise.all([
+          invoke<LauncherPreferences>("read_launcher_preferences"),
+          invoke<SetupInfo>("read_setup_info"),
+        ]);
         setPreferences(nextPreferences);
         setSelectedLanguage(nextPreferences.language);
+        setSetupInfo(nextSetupInfo);
 
         if (nextPreferences.isInitialized) {
           await refreshMainState(nextPreferences.language);
@@ -1766,6 +1828,60 @@ export default function App() {
   };
 
   const handleContinueModelStep = async () => {
+    if (!supportsLocalModels) {
+      if (wantsCloudModel === null) return;
+      if (!wantsCloudModel) {
+        setModelStepMessage("");
+        setSelectedChannel("weixin");
+        setWeixinQrImageSrc(null);
+        setWeixinLoginMessage("");
+        clearStatusMessage({
+          action: "handleContinueModelStep",
+          nextScreen: "channel",
+          mode: "cloud_skip",
+        });
+        setScreen("channel");
+        return;
+      }
+      const normalizedBaseUrl = cloudBaseUrl.trim();
+      const normalizedApiKey = cloudApiKey.trim();
+      const normalizedCloudModelName = cloudModelName.trim();
+      if (normalizedBaseUrl.length === 0) {
+        setModelStepMessage(copy.cloudBaseUrlValidationEmpty);
+        return;
+      }
+      try {
+        const parsedUrl = new URL(normalizedBaseUrl);
+        if (!["http:", "https:"].includes(parsedUrl.protocol)) {
+          setModelStepMessage(copy.cloudBaseUrlInvalid);
+          return;
+        }
+      } catch {
+        setModelStepMessage(copy.cloudBaseUrlInvalid);
+        return;
+      }
+      if (normalizedApiKey.length === 0) {
+        setModelStepMessage(copy.cloudApiKeyValidationEmpty);
+        return;
+      }
+      if (normalizedCloudModelName.length === 0) {
+        setModelStepMessage(copy.cloudModelValidationEmpty);
+        return;
+      }
+
+      setModelStepMessage("");
+      setSelectedChannel("weixin");
+      setWeixinQrImageSrc(null);
+      setWeixinLoginMessage("");
+      clearStatusMessage({
+        action: "handleContinueModelStep",
+        nextScreen: "channel",
+        mode: "cloud",
+      });
+      setScreen("channel");
+      return;
+    }
+
     if (wantsLocalModel === null) return;
     if (wantsLocalModel) {
       const normalizedModelName = localModelName.trim();
@@ -1827,8 +1943,15 @@ export default function App() {
     }
 
     const request: InitialSetupConfigRequest = {};
-    if (wantsLocalModel) {
+    if (supportsLocalModels && wantsLocalModel) {
       request.localModel = localModelName.trim();
+    }
+    if (!supportsLocalModels && wantsCloudModel) {
+      request.cloudModel = {
+        baseUrl: cloudBaseUrl.trim(),
+        apiKey: cloudApiKey.trim(),
+        model: cloudModelName.trim(),
+      };
     }
     request.channelSelection = selectedChannel;
     if (selectedChannel === "qq") {
@@ -2775,78 +2898,172 @@ export default function App() {
       localModelName,
       isValidatingLocalModelName,
     });
-    const disableContinue = modelStepUiState.disableContinue;
+    const disableContinue = supportsLocalModels
+      ? modelStepUiState.disableContinue
+      : wantsCloudModel === null ||
+        (wantsCloudModel &&
+          (cloudBaseUrl.trim().length === 0 ||
+            cloudApiKey.trim().length === 0 ||
+            cloudModelName.trim().length === 0));
 
     return (
       <main className={appFrameClass}>
         <div className="w-full max-w-xl">
           <section className={onboardingCardClass}>
-            <h2 className={titleClass}>{copy.modelQuestion}</h2>
+            <h2 className={titleClass}>
+              {supportsLocalModels
+                ? copy.modelQuestion
+                : copy.cloudModelQuestion}
+            </h2>
 
-            <div className="mt-6 grid grid-cols-2 gap-3">
-              <button
-                className={`${choiceButtonClass} ${
-                  wantsLocalModel === true
-                    ? choiceButtonActiveClass
-                    : choiceButtonInactiveClass
-                }`}
-                onClick={() => setWantsLocalModel(true)}
-                type="button"
-              >
-                {copy.yes}
-              </button>
-              <button
-                className={`${choiceButtonClass} ${
-                  wantsLocalModel === false
-                    ? choiceButtonActiveClass
-                    : choiceButtonInactiveClass
-                }`}
-                onClick={() => setWantsLocalModel(false)}
-                type="button"
-              >
-                {copy.no}
-              </button>
-            </div>
-
-            {modelStepUiState.showNoLocalModelHint ? (
-              <div className="mt-5 rounded-[1.1rem] border border-sky-200 bg-sky-50/80 p-4 text-left text-sm leading-6 text-sky-900">
-                {copy.modelNoLocalHint}
-              </div>
-            ) : null}
-
-            {wantsLocalModel ? (
-              <div className="mt-5 space-y-3">
-                <label className={formLabelClass}>{copy.modelNameLabel}</label>
-                <input
-                  className={inputClass}
-                  disabled={isValidatingLocalModelName}
-                  onChange={(event) => setLocalModelName(event.target.value)}
-                  placeholder={localModelPlaceholder}
-                  type="text"
-                  value={localModelName}
-                />
-                {isValidatingLocalModelName || modelStepMessage ? (
-                  <p
-                    className={`text-sm ${isValidatingLocalModelName ? "text-slate-500" : "text-red-600"}`}
-                  >
-                    {isValidatingLocalModelName
-                      ? copy.validatingModel
-                      : modelStepMessage}
-                  </p>
-                ) : null}
-                <p className="flex flex-wrap items-center gap-2 text-sm text-slate-500">
+            {supportsLocalModels ? (
+              <>
+                <div className="mt-6 grid grid-cols-2 gap-3">
                   <button
-                    className="font-medium text-slate-800 underline underline-offset-4 hover:text-slate-950"
-                    onClick={() => void handleOpenModelSearch()}
+                    className={`${choiceButtonClass} ${
+                      wantsLocalModel === true
+                        ? choiceButtonActiveClass
+                        : choiceButtonInactiveClass
+                    }`}
+                    onClick={() => setWantsLocalModel(true)}
                     type="button"
                   >
-                    {copy.modelSearchLinkLabel}
+                    {copy.yes}
                   </button>
-                  <span>{`${copy.modelSearchInstructionPrefix}${copy.modelSearchInstructionExample}`}</span>
-                </p>
-                {renderMemoryHint()}
-              </div>
-            ) : null}
+                  <button
+                    className={`${choiceButtonClass} ${
+                      wantsLocalModel === false
+                        ? choiceButtonActiveClass
+                        : choiceButtonInactiveClass
+                    }`}
+                    onClick={() => setWantsLocalModel(false)}
+                    type="button"
+                  >
+                    {copy.no}
+                  </button>
+                </div>
+
+                {modelStepUiState.showNoLocalModelHint ? (
+                  <div className="mt-5 rounded-[1.1rem] border border-sky-200 bg-sky-50/80 p-4 text-left text-sm leading-6 text-sky-900">
+                    {copy.modelNoLocalHint}
+                  </div>
+                ) : null}
+
+                {wantsLocalModel ? (
+                  <div className="mt-5 space-y-3">
+                    <label className={formLabelClass}>
+                      {copy.modelNameLabel}
+                    </label>
+                    <input
+                      className={inputClass}
+                      disabled={isValidatingLocalModelName}
+                      onChange={(event) =>
+                        setLocalModelName(event.target.value)
+                      }
+                      placeholder={localModelPlaceholder}
+                      type="text"
+                      value={localModelName}
+                    />
+                    {isValidatingLocalModelName || modelStepMessage ? (
+                      <p
+                        className={`text-sm ${isValidatingLocalModelName ? "text-slate-500" : "text-red-600"}`}
+                      >
+                        {isValidatingLocalModelName
+                          ? copy.validatingModel
+                          : modelStepMessage}
+                      </p>
+                    ) : null}
+                    <p className="flex flex-wrap items-center gap-2 text-sm text-slate-500">
+                      <button
+                        className="font-medium text-slate-800 underline underline-offset-4 hover:text-slate-950"
+                        onClick={() => void handleOpenModelSearch()}
+                        type="button"
+                      >
+                        {copy.modelSearchLinkLabel}
+                      </button>
+                      <span>{`${copy.modelSearchInstructionPrefix}${copy.modelSearchInstructionExample}`}</span>
+                    </p>
+                    {renderMemoryHint()}
+                  </div>
+                ) : null}
+              </>
+            ) : (
+              <>
+                <div className="mt-6 grid grid-cols-2 gap-3">
+                  <button
+                    className={`${choiceButtonClass} ${
+                      wantsCloudModel === true
+                        ? choiceButtonActiveClass
+                        : choiceButtonInactiveClass
+                    }`}
+                    onClick={() => setWantsCloudModel(true)}
+                    type="button"
+                  >
+                    {copy.yes}
+                  </button>
+                  <button
+                    className={`${choiceButtonClass} ${
+                      wantsCloudModel === false
+                        ? choiceButtonActiveClass
+                        : choiceButtonInactiveClass
+                    }`}
+                    onClick={() => setWantsCloudModel(false)}
+                    type="button"
+                  >
+                    {copy.no}
+                  </button>
+                </div>
+
+                {wantsCloudModel === false ? (
+                  <div className="mt-5 rounded-[1.1rem] border border-sky-200 bg-sky-50/80 p-4 text-left text-sm leading-6 text-sky-900">
+                    {copy.modelNoLocalHint}
+                  </div>
+                ) : null}
+
+                {wantsCloudModel ? (
+                  <div className="mt-5 space-y-3">
+                    <p className="rounded-[1.1rem] border border-slate-200/80 bg-slate-50/80 p-4 text-left text-sm leading-6 text-slate-600">
+                      {copy.cloudConfigHint}
+                    </p>
+                    <label className={formLabelClass}>
+                      {copy.cloudBaseUrlLabel}
+                    </label>
+                    <input
+                      className={inputClass}
+                      onChange={(event) => setCloudBaseUrl(event.target.value)}
+                      placeholder={copy.cloudBaseUrlPlaceholder}
+                      type="text"
+                      value={cloudBaseUrl}
+                    />
+                    <label className={formLabelClass}>
+                      {copy.cloudApiKeyLabel}
+                    </label>
+                    <input
+                      className={inputClass}
+                      onChange={(event) => setCloudApiKey(event.target.value)}
+                      placeholder={copy.cloudApiKeyPlaceholder}
+                      type="password"
+                      value={cloudApiKey}
+                    />
+                    <label className={formLabelClass}>
+                      {copy.cloudModelNameLabel}
+                    </label>
+                    <input
+                      className={inputClass}
+                      onChange={(event) =>
+                        setCloudModelName(event.target.value)
+                      }
+                      placeholder={copy.cloudModelNamePlaceholder}
+                      type="text"
+                      value={cloudModelName}
+                    />
+                    {modelStepMessage ? (
+                      <p className="text-sm text-red-600">{modelStepMessage}</p>
+                    ) : null}
+                  </div>
+                ) : null}
+              </>
+            )}
           </section>
 
           <div className="mt-4 flex items-center justify-between px-1">
@@ -3315,7 +3532,7 @@ export default function App() {
                   </div>
 
                   <div className="grid gap-4 xl:grid-cols-2">
-                    {shouldShowLocalModelOverviewCard ? (
+                    {supportsLocalModels && shouldShowLocalModelOverviewCard ? (
                       <section className="rounded-3xl bg-transparent p-5 shadow-[0_16px_48px_rgba(15,23,42,0.12),inset_0_1px_0_rgba(255,255,255,0.9)] backdrop-blur-0">
                         <div className="flex items-start justify-between gap-3">
                           <div className="flex items-start gap-4">
@@ -3520,32 +3737,34 @@ export default function App() {
                     </div>
 
                     <div className="space-y-4">
-                      <button
-                        className={configEntryCardClass}
-                        onClick={() => {
-                          void openLocalModelConfigPage(
-                            shouldShowLocalDownloadProgress,
-                          );
-                        }}
-                        type="button"
-                      >
-                        <span className="flex items-center gap-4">
-                          <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-emerald-100 text-emerald-600">
-                            <LocalModelConfigIcon />
-                          </span>
-                          <span className="min-w-0 text-left">
-                            <span className="block text-[0.98rem] font-semibold tracking-[-0.03em] text-slate-950">
-                              {copy.configCenterLocalModelTitle}
+                      {supportsLocalModels ? (
+                        <button
+                          className={configEntryCardClass}
+                          onClick={() => {
+                            void openLocalModelConfigPage(
+                              shouldShowLocalDownloadProgress,
+                            );
+                          }}
+                          type="button"
+                        >
+                          <span className="flex items-center gap-4">
+                            <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-emerald-100 text-emerald-600">
+                              <LocalModelConfigIcon />
                             </span>
-                            <span className="mt-1 block text-[0.84rem] leading-5 text-slate-500">
-                              {copy.configCenterLocalModelDescription}
+                            <span className="min-w-0 text-left">
+                              <span className="block text-[0.98rem] font-semibold tracking-[-0.03em] text-slate-950">
+                                {copy.configCenterLocalModelTitle}
+                              </span>
+                              <span className="mt-1 block text-[0.84rem] leading-5 text-slate-500">
+                                {copy.configCenterLocalModelDescription}
+                              </span>
                             </span>
                           </span>
-                        </span>
-                        <span className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-slate-400">
-                          <ChevronForwardIcon />
-                        </span>
-                      </button>
+                          <span className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-slate-400">
+                            <ChevronForwardIcon />
+                          </span>
+                        </button>
+                      ) : null}
 
                       <button
                         className={configEntryCardClass}
@@ -4091,7 +4310,8 @@ export default function App() {
                                     <p className="min-w-0 truncate text-sm font-semibold text-slate-900">
                                       {provider}
                                     </p>
-                                    {provider === "ollama" ? (
+                                    {supportsLocalModels &&
+                                    provider === "ollama" ? (
                                       <span className="inline-flex items-center rounded-full bg-emerald-100 px-2 py-0.5 text-[0.68rem] font-medium text-emerald-700">
                                         {copy.ollamaTitle}
                                       </span>
@@ -4433,13 +4653,15 @@ export default function App() {
                     >
                       {copy.logSourceLauncher}
                     </button>
-                    <button
-                      className={`${tertiaryButtonClass} ${selectedLogSource === "ollama" ? "border-[#007AFF]/35 text-[#007AFF]" : ""}`}
-                      onClick={() => setSelectedLogSource("ollama")}
-                      type="button"
-                    >
-                      {copy.logSourceOllama}
-                    </button>
+                    {supportsLocalModels ? (
+                      <button
+                        className={`${tertiaryButtonClass} ${selectedLogSource === "ollama" ? "border-[#007AFF]/35 text-[#007AFF]" : ""}`}
+                        onClick={() => setSelectedLogSource("ollama")}
+                        type="button"
+                      >
+                        {copy.logSourceOllama}
+                      </button>
+                    ) : null}
                     <button
                       className={`${tertiaryButtonClass} ${selectedLogSource === "gateway" ? "border-[#007AFF]/35 text-[#007AFF]" : ""}`}
                       onClick={() => setSelectedLogSource("gateway")}

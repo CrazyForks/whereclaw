@@ -118,6 +118,41 @@ const LOCAL_MODEL_OPTIONS = [
 ] as const;
 
 const FALLBACK_LOCAL_MODEL_NAME = LOCAL_MODEL_OPTIONS[0].name;
+const QQ_GROUP_NUMBER = "1029515693";
+
+async function copyTextToClipboard(text: string) {
+  if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+
+  if (typeof document === "undefined") {
+    throw new Error("Clipboard API unavailable");
+  }
+
+  const textArea = document.createElement("textarea");
+  textArea.value = text;
+  textArea.setAttribute("readonly", "true");
+  textArea.style.position = "fixed";
+  textArea.style.top = "0";
+  textArea.style.left = "0";
+  textArea.style.opacity = "0";
+  textArea.style.pointerEvents = "none";
+
+  document.body.appendChild(textArea);
+  textArea.focus();
+  textArea.select();
+  textArea.setSelectionRange(0, text.length);
+
+  try {
+    const copied = document.execCommand("copy");
+    if (!copied) {
+      throw new Error("execCommand copy returned false");
+    }
+  } finally {
+    document.body.removeChild(textArea);
+  }
+}
 
 function getRecommendedLocalModelName(
   recommendedLimitGb: number | null,
@@ -162,11 +197,7 @@ type SystemMemoryInfo = {
 
 type Screen = "language" | "model" | "channel" | "main";
 type MainNav = "overview" | "config" | "logs";
-type ConfigPage =
-  | "local-model"
-  | "channel"
-  | "model"
-  | "skill";
+type ConfigPage = "local-model" | "channel" | "model" | "skill";
 type LocalModelToggleAction = "enable" | "disable";
 type LogSource = "launcher" | "ollama" | "gateway";
 
@@ -250,6 +281,9 @@ type Copy = {
   openSetup: string;
   openTerminal: string;
   openConfigFile: string;
+  qqGroupMenuLabel: string;
+  qqGroupCopied: string;
+  qqGroupCopyFailed: string;
   setupConfirmTitle: string;
   setupConfirmMessage: string;
   openingSetup: string;
@@ -443,7 +477,7 @@ const copyByLanguage: Record<LauncherLanguage, Copy> = {
     channelQqLabel: "QQ",
     channelSkipLabel: "Skip For Now",
     weixinDescription:
-      "WhereClaw can connect to WeChat with the bundled plugin and complete QR login here.",
+      "Please ensure that WeChat is updated to the latest version and complete the QR code login here.",
     weixinStepTitle: "WeChat Login",
     weixinStepLines: [
       "Click next to start QR login.",
@@ -501,6 +535,9 @@ const copyByLanguage: Record<LauncherLanguage, Copy> = {
     openSetup: "Official Initialization",
     openTerminal: "WhereClaw Terminal",
     openConfigFile: "Config File",
+    qqGroupMenuLabel: `QQ Group ${QQ_GROUP_NUMBER}`,
+    qqGroupCopied: `QQ group number copied: ${QQ_GROUP_NUMBER}`,
+    qqGroupCopyFailed: "Failed to copy QQ group number.",
     setupConfirmTitle: "Open Official Initialization",
     setupConfirmMessage:
       "This will open the official initialization flow. Continue?",
@@ -714,8 +751,7 @@ const copyByLanguage: Record<LauncherLanguage, Copy> = {
     channelWeixinLabel: "微信",
     channelQqLabel: "QQ",
     channelSkipLabel: "暂不接入",
-    weixinDescription:
-      "WhereClaw 会使用内置的微信插件，并在这里完成扫码登录。",
+    weixinDescription: "请确保微信升级到最新版，并在这里完成扫码登录。",
     weixinStepTitle: "微信登录",
     weixinStepLines: [
       "点击下一步开始生成微信二维码。",
@@ -771,6 +807,9 @@ const copyByLanguage: Record<LauncherLanguage, Copy> = {
     openSetup: "官方初始化",
     openTerminal: "WhereClaw 终端",
     openConfigFile: "配置文件",
+    qqGroupMenuLabel: `QQ群${QQ_GROUP_NUMBER}`,
+    qqGroupCopied: `已复制QQ群号：${QQ_GROUP_NUMBER}`,
+    qqGroupCopyFailed: "复制QQ群号失败。",
     setupConfirmTitle: "打开官方初始化",
     setupConfirmMessage: "将要打开 OpenClaw 官方初始化流程，确认继续吗？",
     openingSetup: "打开中...",
@@ -1393,7 +1432,8 @@ export default function App() {
     if (
       nextRequiresExistingLocalModel &&
       !isRequiredLocalModelAvailableForGateway({
-        configuredCurrentModelRequiresExistingLocalModel: nextRequiresExistingLocalModel,
+        configuredCurrentModelRequiresExistingLocalModel:
+          nextRequiresExistingLocalModel,
         configuredCurrentModelName: nextLocalModelName,
         configuredLocalModelExists: nextConfiguredLocalModelExists,
         localModelRunProgress: progressOverride,
@@ -1471,7 +1511,9 @@ export default function App() {
   useEffect(() => {
     void (async () => {
       try {
-        const version = await invoke<string>("read_bundled_openclaw_version_command");
+        const version = await invoke<string>(
+          "read_bundled_openclaw_version_command",
+        );
         setOpenclawVersion(version);
       } catch {
         setOpenclawVersion(null);
@@ -1515,7 +1557,9 @@ export default function App() {
     hasInitializedRecommendedLocalModelRef.current = true;
   }, [defaultRecommendedLocalModelName, hasResolvedRecommendedLocalModel]);
 
-  const previousLocalModelRunProgressRef = useRef<LocalModelRunProgress | null>(null);
+  const previousLocalModelRunProgressRef = useRef<LocalModelRunProgress | null>(
+    null,
+  );
 
   useEffect(() => {
     if (screen !== "main") return;
@@ -1550,7 +1594,9 @@ export default function App() {
           )
         ) {
           showStatusMessage(
-            copyByLanguage[selectedLanguage].statusStartGatewayWaitForModelDownload(
+            copyByLanguage[
+              selectedLanguage
+            ].statusStartGatewayWaitForModelDownload(
               configuredCurrentModelName || progress.model,
             ),
             {
@@ -1762,7 +1808,7 @@ export default function App() {
 
     setModelStepMessage("");
     setSelectedChannel("weixin");
-      setWeixinQrImageSrc(null);
+    setWeixinQrImageSrc(null);
     setWeixinLoginMessage("");
     clearStatusMessage({
       action: "handleContinueModelStep",
@@ -2027,6 +2073,22 @@ export default function App() {
       });
     } finally {
       setIsOpeningTerminal(false);
+    }
+  };
+
+  const handleCopyQqGroupNumber = async () => {
+    try {
+      await copyTextToClipboard(QQ_GROUP_NUMBER);
+      setIsMoreMenuOpen(false);
+      showStatusMessage(copy.qqGroupCopied, {
+        action: "handleCopyQqGroupNumber",
+        qqGroupNumber: QQ_GROUP_NUMBER,
+      });
+    } catch (error) {
+      showStatusError(error, copy.qqGroupCopyFailed, {
+        action: "handleCopyQqGroupNumber",
+        qqGroupNumber: QQ_GROUP_NUMBER,
+      });
     }
   };
 
@@ -3171,6 +3233,20 @@ export default function App() {
                     </span>
                     <span>{copy.navLogs}</span>
                   </button>
+                  {selectedLanguage === "zh-CN" ? (
+                    <button
+                      className={sideNavButtonClass}
+                      onClick={() => {
+                        void handleCopyQqGroupNumber();
+                      }}
+                      type="button"
+                    >
+                      <span className="inline-flex h-4 w-4 items-center justify-center">
+                        <QqGroupIcon />
+                      </span>
+                      <span>{copy.qqGroupMenuLabel}</span>
+                    </button>
+                  ) : null}
                 </div>
               ) : null}
               <button
@@ -3792,11 +3868,10 @@ export default function App() {
                               </p>
                             ) : (
                               visibleLocalModels.map((model) => {
-                                const isActive =
-                                  areLocalModelNamesEquivalent(
-                                    model,
-                                    pendingLocalModelSelection,
-                                  );
+                                const isActive = areLocalModelNamesEquivalent(
+                                  model,
+                                  pendingLocalModelSelection,
+                                );
                                 return (
                                   <button
                                     key={model}
@@ -4142,7 +4217,9 @@ export default function App() {
                             <button
                               className={configAddIconButtonClass}
                               disabled={isOpeningClawhubMarketplace}
-                              onClick={() => void handleOpenClawhubMarketplace()}
+                              onClick={() =>
+                                void handleOpenClawhubMarketplace()
+                              }
                               title={copy.openSkillCatalog}
                               type="button"
                             >
@@ -4342,7 +4419,6 @@ export default function App() {
                     </section>
                   </div>
                 ) : null}
-
               </div>
             ) : null}
 
@@ -5548,6 +5624,36 @@ function FileIcon() {
       />
       <path
         d="M9 16H13"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeWidth="1.8"
+      />
+    </svg>
+  );
+}
+
+function QqGroupIcon() {
+  return (
+    <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
+      <path
+        d="M12 7.5C13.38 7.5 14.5 6.38 14.5 5C14.5 3.62 13.38 2.5 12 2.5C10.62 2.5 9.5 3.62 9.5 5C9.5 6.38 10.62 7.5 12 7.5Z"
+        stroke="currentColor"
+        strokeWidth="1.8"
+      />
+      <path
+        d="M8.5 13C8.5 10.79 10.07 9 12 9C13.93 9 15.5 10.79 15.5 13V15.5H8.5V13Z"
+        stroke="currentColor"
+        strokeLinejoin="round"
+        strokeWidth="1.8"
+      />
+      <path
+        d="M7.5 18.5H16.5"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeWidth="1.8"
+      />
+      <path
+        d="M6 21.5H18"
         stroke="currentColor"
         strokeLinecap="round"
         strokeWidth="1.8"

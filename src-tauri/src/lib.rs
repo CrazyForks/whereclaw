@@ -61,6 +61,7 @@ const TRAY_ICON_ID: &str = "main";
 const TRAY_MENU_SHOW_ID: &str = "tray_show";
 const TRAY_MENU_QUIT_ID: &str = "tray_quit";
 const WEIXIN_CHANNEL_ID: &str = "openclaw-weixin";
+const REMOTE_DESKTOP_MANIFEST_URL: &str = "https://r2.tolearn.cc/manifest.json";
 
 fn tray_icon_file_name_for_target(target_os: &str) -> Option<&'static str> {
     match target_os {
@@ -209,6 +210,34 @@ struct ExitIntentState {
 
 struct InitialWeixinLoginState {
     pending: Arc<Mutex<HashMap<String, Receiver<Result<InitialWeixinLoginWaitResult, String>>>>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RemoteManifestPayload {
+    #[serde(default)]
+    notifications: RemoteManifestNotifications,
+    desktop: Option<RemoteManifestDesktop>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RemoteManifestNotifications {
+    #[serde(default)]
+    cn: Vec<String>,
+    #[serde(default)]
+    en: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RemoteManifestDesktop {
+    version: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteManifestState {
+    notifications: Vec<String>,
+    remote_version: Option<String>,
+    has_update: bool,
 }
 
 fn show_main_window(app: &AppHandle) -> Result<(), String> {
@@ -596,6 +625,8 @@ struct LauncherPreferences {
     has_saved_preferences: bool,
     is_initialized: bool,
     is_initialization_in_progress: bool,
+    dismissed_remote_notification_fingerprint_zh_cn: Option<String>,
+    dismissed_remote_notification_fingerprint_en: Option<String>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -607,6 +638,10 @@ struct StoredLauncherPreferences {
     is_initialized: bool,
     #[serde(default)]
     is_initialization_in_progress: bool,
+    #[serde(default)]
+    dismissed_remote_notification_fingerprint_zh_cn: Option<String>,
+    #[serde(default)]
+    dismissed_remote_notification_fingerprint_en: Option<String>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -2448,6 +2483,17 @@ async fn read_bundled_openclaw_version_command(app: AppHandle) -> Result<String,
 }
 
 #[tauri::command]
+async fn read_remote_manifest_state(
+    app: AppHandle,
+    language: String,
+) -> Result<RemoteManifestState, String> {
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || Ok(read_remote_manifest_state_impl(&app, &language)))
+        .await
+        .map_err(|error| format!("failed to join remote manifest task: {error}"))?
+}
+
+#[tauri::command]
 async fn read_launcher_preferences(app: AppHandle) -> Result<LauncherPreferences, String> {
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || read_launcher_preferences_impl(&app))
@@ -2462,6 +2508,8 @@ async fn save_launcher_preferences(
     install_dir: String,
     is_initialized: Option<bool>,
     is_initialization_in_progress: Option<bool>,
+    dismissed_remote_notification_fingerprint_zh_cn: Option<String>,
+    dismissed_remote_notification_fingerprint_en: Option<String>,
 ) -> Result<LauncherPreferences, String> {
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -2471,6 +2519,8 @@ async fn save_launcher_preferences(
             &install_dir,
             is_initialized,
             is_initialization_in_progress,
+            dismissed_remote_notification_fingerprint_zh_cn,
+            dismissed_remote_notification_fingerprint_en,
         )
     })
     .await
@@ -2685,6 +2735,8 @@ async fn apply_initial_setup_config(
             &preferences.install_dir,
             Some(true),
             Some(false),
+            None,
+            None,
         )?;
         read_setup_info_impl(&app)
     })
@@ -4478,6 +4530,112 @@ fn read_bundled_openclaw_version(app: &AppHandle) -> Result<String, String> {
     read_bundled_openclaw_version_from_package_root(&package_root)
 }
 
+fn parse_version_segments(value: &str) -> Option<Vec<u64>> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    trimmed
+        .split('.')
+        .map(|segment| segment.parse::<u64>().ok())
+        .collect()
+}
+
+fn is_remote_version_newer(remote: &str, local: &str) -> bool {
+    let Some(remote_segments) = parse_version_segments(remote) else {
+        return false;
+    };
+    let Some(local_segments) = parse_version_segments(local) else {
+        return false;
+    };
+    let max_len = remote_segments.len().max(local_segments.len());
+
+    for index in 0..max_len {
+        let remote_value = *remote_segments.get(index).unwrap_or(&0);
+        let local_value = *local_segments.get(index).unwrap_or(&0);
+        if remote_value > local_value {
+            return true;
+        }
+        if remote_value < local_value {
+            return false;
+        }
+    }
+
+    false
+}
+
+fn normalize_remote_version(version: Option<String>) -> Option<String> {
+    version
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn select_remote_notifications(payload: &RemoteManifestPayload, language: &str) -> Vec<String> {
+    let source = if language == "zh-CN" {
+        &payload.notifications.cn
+    } else {
+        &payload.notifications.en
+    };
+
+    source
+        .iter()
+        .map(|entry| entry.trim())
+        .filter(|entry| !entry.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+fn empty_remote_manifest_state() -> RemoteManifestState {
+    RemoteManifestState::default()
+}
+
+fn read_remote_manifest_state_impl(app: &AppHandle, language: &str) -> RemoteManifestState {
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return empty_remote_manifest_state(),
+    };
+
+    let response = match client
+        .get(REMOTE_DESKTOP_MANIFEST_URL)
+        .send()
+        .and_then(|response| response.error_for_status())
+    {
+        Ok(response) => response,
+        Err(_) => return empty_remote_manifest_state(),
+    };
+
+    let payload_text = match response.text() {
+        Ok(payload) => payload,
+        Err(_) => return empty_remote_manifest_state(),
+    };
+    let payload = match serde_json::from_str::<RemoteManifestPayload>(&payload_text) {
+        Ok(payload) => payload,
+        Err(_) => return empty_remote_manifest_state(),
+    };
+
+    let local_version = app.package_info().version.to_string();
+    let remote_version = normalize_remote_version(
+        payload
+            .desktop
+            .as_ref()
+            .and_then(|desktop| desktop.version.as_deref().map(String::from)),
+    );
+    let has_update = remote_version
+        .as_deref()
+        .map(|version| is_remote_version_newer(version, &local_version))
+        .unwrap_or(false);
+
+    RemoteManifestState {
+        notifications: select_remote_notifications(&payload, language),
+        remote_version: remote_version.clone(),
+        has_update,
+    }
+}
+
 fn resolve_default_openclaw_home_dir(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(resolve_launcher_data_dir(app)?.join("openclaw-home"))
 }
@@ -4536,6 +4694,8 @@ fn read_launcher_preferences_impl(app: &AppHandle) -> Result<LauncherPreferences
             has_saved_preferences: false,
             is_initialized: false,
             is_initialization_in_progress: false,
+            dismissed_remote_notification_fingerprint_zh_cn: None,
+            dismissed_remote_notification_fingerprint_en: None,
         });
     }
 
@@ -4552,6 +4712,10 @@ fn read_launcher_preferences_impl(app: &AppHandle) -> Result<LauncherPreferences
         has_saved_preferences: true,
         is_initialized: stored.is_initialized,
         is_initialization_in_progress: stored.is_initialization_in_progress,
+        dismissed_remote_notification_fingerprint_zh_cn: stored
+            .dismissed_remote_notification_fingerprint_zh_cn,
+        dismissed_remote_notification_fingerprint_en: stored
+            .dismissed_remote_notification_fingerprint_en,
     })
 }
 
@@ -4561,6 +4725,8 @@ fn save_launcher_preferences_impl(
     install_dir: &str,
     is_initialized: Option<bool>,
     is_initialization_in_progress: Option<bool>,
+    dismissed_remote_notification_fingerprint_zh_cn: Option<String>,
+    dismissed_remote_notification_fingerprint_en: Option<String>,
 ) -> Result<LauncherPreferences, String> {
     let language = normalize_launcher_language(language)?;
     let install_dir = normalize_install_dir(install_dir)?;
@@ -4590,6 +4756,26 @@ fn save_launcher_preferences_impl(
                 .map(|preferences| preferences.is_initialization_in_progress)
                 .unwrap_or(false)
         }),
+        dismissed_remote_notification_fingerprint_zh_cn:
+            dismissed_remote_notification_fingerprint_zh_cn.or_else(|| {
+                existing
+                    .as_ref()
+                    .and_then(|preferences| {
+                        preferences
+                            .dismissed_remote_notification_fingerprint_zh_cn
+                            .clone()
+                    })
+            }),
+        dismissed_remote_notification_fingerprint_en:
+            dismissed_remote_notification_fingerprint_en.or_else(|| {
+                existing
+                    .as_ref()
+                    .and_then(|preferences| {
+                        preferences
+                            .dismissed_remote_notification_fingerprint_en
+                            .clone()
+                    })
+            }),
     };
     let content = serde_json::to_string_pretty(&stored)
         .map_err(|error| format!("failed to serialize launcher settings: {error}"))?;
@@ -6689,6 +6875,7 @@ pub fn run() {
             open_model_add_wizard,
             read_setup_info,
             read_bundled_openclaw_version_command,
+            read_remote_manifest_state,
             read_launcher_preferences,
             save_launcher_preferences,
             reset_launcher_state,

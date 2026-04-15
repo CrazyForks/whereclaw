@@ -29,6 +29,8 @@ type LauncherPreferences = {
   hasSavedPreferences: boolean;
   isInitialized: boolean;
   isInitializationInProgress: boolean;
+  dismissedRemoteNotificationFingerprintZhCn: string | null;
+  dismissedRemoteNotificationFingerprintEn: string | null;
 };
 
 type SetupInfo = {
@@ -105,6 +107,12 @@ type InstalledSkillEntry = {
   hasReferences: boolean;
   hasScripts: boolean;
   enabled: boolean;
+};
+
+type RemoteManifestState = {
+  notifications: string[];
+  remoteVersion: string | null;
+  hasUpdate: boolean;
 };
 
 const MIN_LAUNCH_SPLASH_MS = 2000;
@@ -1158,6 +1166,13 @@ export default function App() {
   const [memoryInfoFailed, setMemoryInfoFailed] = useState(false);
   const [appVersion, setAppVersion] = useState<string | null>(null);
   const [openclawVersion, setOpenclawVersion] = useState<string | null>(null);
+  const [remoteNotifications, setRemoteNotifications] = useState<string[]>([]);
+  const [hasRemoteUpdate, setHasRemoteUpdate] = useState(false);
+  const [remoteDesktopVersion, setRemoteDesktopVersion] = useState<string | null>(
+    null,
+  );
+  const [isRemoteNotificationDismissed, setIsRemoteNotificationDismissed] =
+    useState(false);
 
   const appendFrontendStatusLog = (
     level: StatusLogLevel,
@@ -1220,6 +1235,21 @@ export default function App() {
   const copy = copyByLanguage[selectedLanguage];
   const supportsLocalModels = setupInfo?.supportsLocalModels ?? false;
   const consoleVersionLabel = `${copy.consoleVersionName} v${appVersion ?? "..."}`;
+  const remoteNotificationFingerprint =
+    remoteNotifications.length > 0
+      ? JSON.stringify({
+          language: selectedLanguage,
+          notifications: remoteNotifications,
+        })
+      : null;
+  const dismissedRemoteNotificationFingerprint =
+    selectedLanguage === "zh-CN"
+      ? preferences?.dismissedRemoteNotificationFingerprintZhCn ?? null
+      : preferences?.dismissedRemoteNotificationFingerprintEn ?? null;
+  const shouldShowRemoteNotifications =
+    remoteNotifications.length > 0 &&
+    !isRemoteNotificationDismissed &&
+    remoteNotificationFingerprint !== dismissedRemoteNotificationFingerprint;
   const configured = setupInfo?.configured ?? false;
   const isReady = gatewayStatus?.running ?? false;
   const isOllamaReady = ollamaStatus?.running ?? false;
@@ -1569,6 +1599,46 @@ export default function App() {
       }
     })();
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    void (async () => {
+      try {
+        const remoteState = await invoke<RemoteManifestState>(
+          "read_remote_manifest_state",
+          {
+            language: selectedLanguage,
+          },
+        );
+        if (cancelled) {
+          return;
+        }
+        setRemoteNotifications(
+          Array.isArray(remoteState.notifications)
+            ? remoteState.notifications.filter((entry) => entry.trim().length > 0)
+            : [],
+        );
+        setHasRemoteUpdate(Boolean(remoteState.hasUpdate));
+        setRemoteDesktopVersion(remoteState.remoteVersion ?? null);
+      } catch {
+        if (cancelled) {
+          return;
+        }
+        setRemoteNotifications([]);
+        setHasRemoteUpdate(false);
+        setRemoteDesktopVersion(null);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedLanguage]);
+
+  useEffect(() => {
+    setIsRemoteNotificationDismissed(false);
+  }, [selectedLanguage, remoteNotificationFingerprint]);
 
   useEffect(() => {
     void (async () => {
@@ -2152,6 +2222,45 @@ export default function App() {
       showStatusError(error, copy.openUiFailed, {
         action: "handleOpenWhereClawWebsite",
         url: "https://whereclaw.com",
+      });
+    }
+  };
+
+  const handleDismissRemoteNotifications = async () => {
+    if (!preferences || !remoteNotificationFingerprint) {
+      setIsRemoteNotificationDismissed(true);
+      return;
+    }
+
+    const nextDismissedZhCn =
+      selectedLanguage === "zh-CN"
+        ? remoteNotificationFingerprint
+        : preferences.dismissedRemoteNotificationFingerprintZhCn;
+    const nextDismissedEn =
+      selectedLanguage === "en"
+        ? remoteNotificationFingerprint
+        : preferences.dismissedRemoteNotificationFingerprintEn;
+
+    setIsRemoteNotificationDismissed(true);
+
+    try {
+      const nextPreferences = await invoke<LauncherPreferences>(
+        "save_launcher_preferences",
+        {
+          language: preferences.language,
+          installDir: preferences.installDir,
+          isInitialized: preferences.isInitialized,
+          isInitializationInProgress: preferences.isInitializationInProgress,
+          dismissedRemoteNotificationFingerprintZhCn: nextDismissedZhCn,
+          dismissedRemoteNotificationFingerprintEn: nextDismissedEn,
+        },
+      );
+      setPreferences(nextPreferences);
+    } catch (error) {
+      setIsRemoteNotificationDismissed(false);
+      showStatusError(error, copy.saveFailed, {
+        action: "handleDismissRemoteNotifications",
+        language: selectedLanguage,
       });
     }
   };
@@ -3335,6 +3444,21 @@ export default function App() {
               </div>
               <div className="mt-1 flex items-center justify-center gap-1.5 text-sm text-slate-500">
                 <p>{consoleVersionLabel}</p>
+                {hasRemoteUpdate ? (
+                  <button
+                    aria-label={copy.updateAvailableLabel}
+                    className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-emerald-200 bg-emerald-50 text-emerald-700 transition hover:border-emerald-300 hover:bg-emerald-100"
+                    onClick={() => void handleOpenWhereClawWebsite()}
+                    title={
+                      remoteDesktopVersion
+                        ? `${copy.updateAvailableLabel} v${remoteDesktopVersion}`
+                        : copy.updateAvailableLabel
+                    }
+                    type="button"
+                  >
+                    <RemoteUpdateIcon />
+                  </button>
+                ) : null}
               </div>
             </div>
 
@@ -3517,6 +3641,28 @@ export default function App() {
             className="h-full overflow-y-auto rounded-3xl bg-white/72 p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.9)] backdrop-blur-2xl sm:p-5"
             ref={contentScrollContainerRef}
           >
+            {shouldShowRemoteNotifications ? (
+              <section className="mb-4 rounded-3xl border border-amber-200/80 bg-amber-50/90 px-4 py-3 shadow-[inset_0_1px_0_rgba(255,255,255,0.9)]">
+                <div className="flex items-start gap-3">
+                  <div className="min-w-0 flex-1 space-y-1.5 text-sm leading-6 text-amber-950">
+                    {remoteNotifications.map((message, index) => (
+                      <p key={`${selectedLanguage}-${index}-${message}`}>
+                        {message}
+                      </p>
+                    ))}
+                  </div>
+                  <button
+                    aria-label={copy.close}
+                    className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-amber-200/90 bg-white/70 text-amber-900 transition hover:border-amber-300 hover:bg-white"
+                    onClick={() => void handleDismissRemoteNotifications()}
+                    title={copy.close}
+                    type="button"
+                  >
+                    <CloseIcon />
+                  </button>
+                </div>
+              </section>
+            ) : null}
             {mainNav === "overview" ? (
               <>
                 <div className="flex min-h-full flex-col gap-4">
@@ -5929,6 +6075,27 @@ function WebsiteIcon() {
       />
       <path
         d="M19 5L11 13"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="1.8"
+      />
+    </svg>
+  );
+}
+
+function RemoteUpdateIcon() {
+  return (
+    <svg aria-hidden="true" className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24">
+      <path
+        d="M8 16L16 8"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="1.8"
+      />
+      <path
+        d="M10 8H16V14"
         stroke="currentColor"
         strokeLinecap="round"
         strokeLinejoin="round"

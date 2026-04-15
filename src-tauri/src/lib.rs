@@ -5792,7 +5792,7 @@ fn start_initial_weixin_login_impl(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = command
+    let mut child = hide_windows_console(&mut command)
         .spawn()
         .map_err(|error| format!("failed to start WeChat login helper: {error}"))?;
     let stdout = child
